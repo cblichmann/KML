@@ -1,87 +1,89 @@
-# Introduction
+# Kernel Mode Linux (KML) for Linux 7.3
 
-## TL; DR How to apply
+Kernel Mode Linux (KML) executes trusted user-space ELF binaries (placed under `/trusted/`) at the CPU's kernel privilege level—**Ring 0 (`CPL=0`) on `x86_64`** and **`SYSTEM_MODE` on 32-bit `arm`**—so user processes retain standard virtual memory, demand paging, signals, `fork()`, and `PREEMPT_RT` scheduling while accessing kernel address space and invoking kernel functions directly without hardware privilege transitions.
 
-This patch is based on Linux 4.4.12 with PREEMPT_RT.
-You need to prepare that before applying.
+---
+
+## TL;DR — How to Apply & Run (Linux 7.3)
+
+Mainline Linux 7.3 already integrates `PREEMPT_RT` natively (`CONFIG_PREEMPT_RT=y`, merged upstream in Linux 6.12), so no external `-rt` patchset is needed.
 
 ```shell-session
-# 0. Clone this repository
-git clone git@github.com:sonicyang/KML.git
+# 1. Clone this repository and mainline Linux 7.3 side-by-side
+git clone git@github.com:cblichmann/KML.git
+git clone -b v7.3 --depth 1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux-7.3
 
-# 1. Clone Linux 4.4.12
-git clone -b v4.4.12 --depth 1 git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+# 2. Apply the two KML patches
+cd linux-7.3
+git am ../KML/*.patch
+cd ../KML
 
-# You will get a copy of Linux 4.4.12 source in directory linux
+# 3. Build the x86_64 PREEMPT_RT + KML kernel, build the initramfs, and run the QEMU TCG test suite
+cd qemu-test
+./build-kernel.sh
+./build-initramfs.sh
+./run-qemu.sh --test
 
-# 2. Download PREEMPT_RT patch
-wget https://cdn.kernel.org/pub/linux/kernel/projects/rt/4.4/older/patch-4.4.12-rt18.patch.xz
-
-# You will get a file patch-4.4.12-rt18.patch.xz
-
-# 3. Apply the PREEMPT_RT patch
-cd linux
-xzcat ../patch-4.4.12-rt18.patch.xz | patch -p1
-
-# You will have a modified Linux 4.4.12 source with PREEMPT_RT, now.
-
-# 4. Commit the the changes at once (Otherwise, git am will fail)
-git add .
-git commit -m "Apply PREEMPT_RT"
-
-# Now you should have a clean git repository without unstaged changes
-
-# 5. Apply these 2 patches
-cp ../KML/*.patch .
-git am *.patch
-
-# You are good to go
-# Compile the kernel then you should be able to use KML
+# 4. Or boot an interactive guest shell in QEMU TCG software emulation mode (VM-safe, no KVM required)
+./run-qemu.sh
 ```
 
-## KML
-Kernel-Mode Linux is a technology which enables us to execute user programs in kernel mode. In Kernel Mode Linux, user programs can be executed as user processes that have the privilege level of kernel mode. The benefit of executing user programs in kernel mode is that the user programs can access kernel address space directly. For example, user programs can invoke system calls very fast because it is unnecessary to switch between a kernel mode and user-mode by using costly software interruptions or context switches. In addition, user programs are executed as ordinary processes (except for their privilege level, of course), so scheduling and paging are performed as usual, unlike kernel modules. With this technology, we can implement the real time task in user space with advantages of flexibility and low latency.
+---
 
-KML supports generic x86_64 and ARM architecture family. At present, we evaluate KML on ARM platform along with real time enhancements, such as PREEMPT_RT and tickless kernel. The major differential of KML on ARM is that user processes specified by KML are created within SYSTEM_MODE by setting the CPSR register as SYSTEM mode and authorize this program the access of the kernel address by set_fs(KERNEL_DS). However, on ARM platform, not all system calls can be invoked directly. If the schedule related functions like schedule used in KML, the whole system will freeze or go into segfault. This reason of this restriction is not clarified and needs further investigation.
-Limitation of Resource Access
+## Repository Contents
 
-With KML, though the user programs can invoke the kernel functions directly, they can't understand the symbols of these functions. One solution is that the user program invokes the kernel functions by addresses directly. Here is an example. If we want to invoke the kernel function, sys_clock_gettime, in KML user program, we can first find out the address from kernel's ELF image, named after vmlinx, by the nm command and invoke this address by casting it to a function. e.g.
+| Path | Description |
+| :--- | :--- |
+| `0001-Integrate-KML.patch` | Core KML integration for Linux 7.3 (`x86_64` Ring 0 + 32-bit `arm` `SYSTEM_MODE`, `TIF_KU` kernel-pointer `uaccess`, `/trusted/` loader with `chroot` guard, `IST_INDEX_KML` exception/IRQ stack switching). |
+| `0002-Use-VDSO-as-the-wrapper-for-KML-resource.patch` | KML vDSO direct-call wrappers (`clock_gettime`, `gettimeofday`, `sched_yield`, `nanosleep`, `kernel_sched_timeout`, `trace_call_by_kml`, `kml_syscall`, `kml_call`) via `vdso_time_data` and `kml_trampoline`. |
+| `qemu-test/` | Turnkey `x86_64` QEMU test, demo, and microbenchmark suite (defaults to `-machine q35,accel=tcg` software emulation). |
+| `LICENSE` | GNU General Public License v2.0. |
 
-Declaration:
+---
+
+## Kernel Configuration
+
+### `x86_64` (`qemu-test/build-kernel.sh` configures these automatically)
+
+- `CONFIG_EXPERT=y`
+- `CONFIG_PREEMPT_RT=y` *(optional, recommended for real-time workloads)*
+- `CONFIG_MITIGATION_PAGE_TABLE_ISOLATION=n` *(required so Ring-0 user processes share unified page tables)*
+- `CONFIG_X86_FRED=n` and `CONFIG_XEN_PV=n`
+- `CONFIG_KERNEL_MODE_LINUX=y`
+- `CONFIG_KML_CHECK_CHROOT=y`
+
+### `arm` (32-bit ARMv7, e.g. `multi_v7_defconfig`)
+
+- `CONFIG_EXPERT=y`
+- `CONFIG_ARM_LPAE=n`
+- `CONFIG_ARM_PAN=n` *(disables `CONFIG_CPU_SW_DOMAIN_PAN` / `CONFIG_CPU_TTBR0_PAN`)*
+- `CONFIG_VDSO=y`
+- `CONFIG_KERNEL_MODE_LINUX=y`
+- `CONFIG_KML_CHECK_CHROOT=y`
+
+---
+
+## Using the KML vDSO from User Programs
+
+Rather than hardcoding `vmlinux` symbol addresses, link user programs against the built vDSO shared object (`build-x86_64/arch/x86/entry/vdso/vdso64/vdso64.so` on `x86_64`, or `arch/arm/vdso/vdso.so` on `arm`):
+
+```bash
+VDSO_SO=../build-x86_64/arch/x86/entry/vdso/vdso64/vdso64.so
+
+gcc -O2 my_kml_app.c \
+  -Wl,--no-as-needed "${VDSO_SO}" -Wl,--as-needed \
+  -o my_kml_app
 ```
-long sys_clock_gettime(clockid_t which_clock, struct timespec __user *tp);
+
+Verify that symbols bind to version `LINUX_2.6` (resolved from `[vdso]` at runtime):
+
+```shell-session
+$ nm -D my_kml_app | grep LINUX_2.6
+                 U clock_gettime@LINUX_2.6
+                 U kernel_sched_timeout@LINUX_2.6
+                 U trace_call_by_kml@LINUX_2.6
 ```
 
-Invoke sys_clock_gettime in KML by address:
-```
-((long (*)(clockid_t which_clock, struct timespec *tp))0x8007fa20)(CLOCK_MONOTONIC, &time2);
-
-```
-
-It is very inconvenient for this solution because the user program needs to modify this address whenever the kernel is updated.
-
-##vDSO
-The vDSO, virtual dynamic shared object, is a small shared library that the kernel automatically maps into the address space of all user-space applications. User programs usually do not need to concern themselves with these details as the vDSO is most commonly called by the C library. This technique provides a good interface for the KML user program to access the kernel resource through symbols. When kernel is updated, what we need to do is rebuild the user program by relinking it with the new vDSO library.
-Known Issues:
- - Scheduling specific operations provided by Linux kernel such as schedule can not be invoked in KML user program, otherwise system will freeze or get into segmentation faults.
- - On AM572x, powered by Cortex A15 core, LPAE (i.e. CONFIG_ARM_LPAE) should be disabled.
-
-##Instructions:
-
-KML now is evaluated on AM572x and i.MX6Q SDB with Linux4.4.12. To enable it, get the kernel source with 4.4.12 version and patch it by the following patch files.
- - 0001-Integrate-KML.patch
- - 0002-Use-VDSO-as-the-wrapper-for-KML-resource.patch
-
-Then say Y in Kernel Mode Linux and VDSO field of kernel configuration, and N for ARM LPAE.
- - CONFIG_KERNEL_MODE_LINUX=y
- - CONFIG_KML_CHECK_CHROOT=y
- - CONFIG_VDSO=y
- - CONFIG_ARM_LPAE=N
-
-In addition to the Linux kernel, the KML user program needs to be linked with vdso.so produced in kernel building (located in arch/arm/vdso/vdso.so). Simply supply vdso.so together with other object files while linking. If the program is linked with vdso correctly, the source of the symbols provided by vDSO should be LINUX not GLIBC. Here is an example for clock_gettime in vDSO.
-```
-$ arm-linux-gnueabihf-nm  build/user/drivers/mctest | grep clock_gettime
-         U clock_gettime@@LINUX_2.6
-```
-
-The KML user program should be put under the "/trusted" directory.
+Install the executable under `/trusted/my_kml_app` on the root filesystem:
+- Running `/trusted/my_kml_app` launches it in **Ring 0 (`CPL=0`)**, where vDSO wrappers invoke kernel routines directly on `current`'s kernel stack via `kml_trampoline` (preserving `%cs` across `PREEMPT_RT` sleeps and SMP CPU migrations).
+- Running the exact same binary outside `/trusted/` (or inside a `chroot` jail when `CONFIG_KML_CHECK_CHROOT=y`) runs it in **Ring 3 (`CPL=3`)**, where standard vDSO timekeeping remains active and KML-only entry points safely return `-EPERM`.

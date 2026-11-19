@@ -1,39 +1,69 @@
-From a1440a4b6b16704ab7d6b1ad83e0be9b4b26dc33 Mon Sep 17 00:00:00 2001
-From: George Kang <georgekang03@gmail.com>
-Date: Mon, 29 Aug 2016 11:54:43 +0800
+From 8261be2568554897b23524ffbdf9810b569267b3 Mon Sep 17 00:00:00 2001
+From: Christian Blichmann <cblichmann@google.com>
+Date: Thu, 19 Nov 2026 12:22:05 +0100
 Subject: [PATCH 1/2] Integrate KML
 
+Port Kernel Mode Linux (KML) to Linux 7.3 for both x86_64 and ARM:
+
+- Add CONFIG_KERNEL_MODE_LINUX and CONFIG_KML_CHECK_CHROOT Kconfig options
+  and Sphinx documentation under Documentation/admin-guide/kml.rst.
+- Launch trusted ELF binaries under /trusted/ in kernel privilege mode via
+  start_kernel_thread() in fs/binfmt_elf.c, with chroot safety checks.
+- Authorize kernel-address uaccess for TIF_KU tasks (replacing the legacy
+  set_fs(KERNEL_DS) mechanism removed in Linux 5.10-5.19).
+- Implement x86_64 Ring-0 user execution using a dedicated __KML_CS GDT
+  descriptor, per-CPU IST_INDEX_KML interrupt/exception stack switching,
+  signal/syscall CS/SS preservation, and SMEP/SMAP disablement.
+- Port 32-bit ARM SYSTEM_MODE execution, exception vector dispatch, and
+  TIF_KU handling to Linux 7.3.
 ---
- CREDITS                            |  4 +++
- Documentation/00-INDEX             |  2 ++
- Documentation/kml.txt              | 50 +++++++++++++++++++++++++++++
- MAINTAINERS                        |  6 ++++
- Makefile                           |  2 +-
- arch/arm/Kconfig                   |  4 +++
- arch/arm/include/asm/processor.h   | 32 +++++++++++++++++++
- arch/arm/include/asm/ptrace.h      | 11 +++++++
- arch/arm/include/asm/thread_info.h | 16 ++++++++++
- arch/arm/kernel/entry-armv.S       | 16 ++++++++++
- arch/arm/lib/uaccess_with_memcpy.c | 12 ++++++-
- arch/arm/vfp/vfphw.S               | 13 ++++++++
- drivers/pnp/pnpbios/bioscalls.c    |  4 +++
- fs/binfmt_elf.c                    | 64 ++++++++++++++++++++++++++++++++++++--
- fs/compat_binfmt_elf.c             |  3 ++
- init/do_mounts.c                   |  8 +++++
- kernel/Kconfig.kml                 | 34 ++++++++++++++++++++
- kernel/tracepoint.c                |  5 +++
- lib/iov_iter.c                     |  4 +++
- mm/memory.c                        |  4 +++
- security/tomoyo/network.c          |  4 +++
- 21 files changed, 294 insertions(+), 4 deletions(-)
- create mode 100644 Documentation/kml.txt
+ CREDITS                               |  4 ++
+ Documentation/admin-guide/index.rst   |  1 +
+ Documentation/admin-guide/kml.rst     | 59 ++++++++++++++++
+ Kconfig                               |  2 +
+ MAINTAINERS                           |  8 +++
+ Makefile                              |  2 +-
+ arch/arm/Kconfig                      |  1 +
+ arch/arm/include/asm/processor.h      | 29 ++++++++
+ arch/arm/include/asm/ptrace.h         | 12 ++++
+ arch/arm/include/asm/thread_info.h    |  6 ++
+ arch/arm/include/asm/uaccess.h        | 17 ++++-
+ arch/arm/kernel/entry-armv.S          | 18 ++++-
+ arch/arm/kernel/process.c             |  8 +++
+ arch/x86/Kconfig                      |  1 +
+ arch/x86/entry/entry_64.S             | 63 +++++++++++++++--
+ arch/x86/entry/syscall_64.c           |  6 ++
+ arch/x86/include/asm/cpu_entry_area.h | 15 ++++-
+ arch/x86/include/asm/page_64_types.h  |  1 +
+ arch/x86/include/asm/processor.h      |  4 ++
+ arch/x86/include/asm/ptrace.h         |  6 ++
+ arch/x86/include/asm/segment.h        |  6 ++
+ arch/x86/include/asm/thread_info.h    |  6 ++
+ arch/x86/include/asm/traps.h          |  3 +
+ arch/x86/include/asm/uaccess_64.h     | 11 +++
+ arch/x86/kernel/cpu/common.c          | 16 +++++
+ arch/x86/kernel/dumpstack_64.c        |  6 +-
+ arch/x86/kernel/idt.c                 | 97 +++++++++++++++++----------
+ arch/x86/kernel/process_64.c          | 17 +++++
+ arch/x86/kernel/signal_64.c           | 33 +++++++--
+ arch/x86/kernel/traps.c               | 24 +++++++
+ arch/x86/mm/cpu_entry_area.c          |  3 +
+ arch/x86/mm/fault.c                   |  3 +-
+ fs/binfmt_elf.c                       | 49 ++++++++++++++
+ include/asm-generic/access_ok.h       |  4 ++
+ include/linux/kml.h                   |  9 +++
+ kernel/Kconfig.kml                    | 40 +++++++++++
+ kernel/tracepoint.c                   |  9 +++
+ 37 files changed, 542 insertions(+), 57 deletions(-)
+ create mode 100644 Documentation/admin-guide/kml.rst
+ create mode 100644 include/linux/kml.h
  create mode 100644 kernel/Kconfig.kml
 
 diff --git a/CREDITS b/CREDITS
-index 8207cc6..8ee3083 100644
+index a0bd941ca..1cb3bd2e9 100644
 --- a/CREDITS
 +++ b/CREDITS
-@@ -2296,6 +2296,10 @@ S: PO BOX 220, HFX. CENTRAL
+@@ -2625,6 +2625,10 @@ S: PO BOX 220, HFX. CENTRAL
  S: Halifax, Nova Scotia
  S: Canada B3J 3C8
  
@@ -44,172 +74,182 @@ index 8207cc6..8ee3083 100644
  N: Kai Mäkisara
  E: Kai.Makisara@kolumbus.fi
  D: SCSI Tape Driver
-diff --git a/Documentation/00-INDEX b/Documentation/00-INDEX
-index cd077ca..7bd8c5c 100644
---- a/Documentation/00-INDEX
-+++ b/Documentation/00-INDEX
-@@ -267,6 +267,8 @@ kmemcheck.txt
- 	- info on dynamic checker that detects uses of uninitialized memory.
- kmemleak.txt
- 	- info on how to make use of the kernel memory leak detection system
-+kml.txt
-+	- info on Kernel Mode Linux.
- ko_KR/
- 	- directory with Korean translations of various documents
- kobject.txt
-diff --git a/Documentation/kml.txt b/Documentation/kml.txt
+diff --git a/Documentation/admin-guide/index.rst b/Documentation/admin-guide/index.rst
+index cd28dfe91..94701ab7f 100644
+--- a/Documentation/admin-guide/index.rst
++++ b/Documentation/admin-guide/index.rst
+@@ -102,6 +102,7 @@ likely to be of interest on almost any system.
+    numastat
+    pm/index
+    syscall-user-dispatch
++   kml
+ 
+ Support for non-native binary formats.  Note that some of these
+ documents are ... old ...
+diff --git a/Documentation/admin-guide/kml.rst b/Documentation/admin-guide/kml.rst
 new file mode 100644
-index 0000000..5ae61c8
+index 000000000..3f0e3fcb7
 --- /dev/null
-+++ b/Documentation/kml.txt
-@@ -0,0 +1,50 @@
++++ b/Documentation/admin-guide/kml.rst
+@@ -0,0 +1,59 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=================
++Kernel Mode Linux
++=================
++
 +Kernel Mode Linux (http://web.yl.is.s.u-tokyo.ac.jp/~tosh/kml)
-+Copyright 2004,2005 Toshiyuki Maeda
++Copyright 2004, 2005 Toshiyuki Maeda
 +
++Introduction
++============
 +
-+Introduction:
++Kernel Mode Linux (KML) is a mechanism that executes selected user-space
++programs at the processor's kernel privilege level. Under Kernel Mode Linux,
++trusted user programs execute as ordinary user processes (with normal virtual
++memory, paging, signals, and scheduling), except that they run with kernel-mode
++CPU privilege and can access kernel address space and invoke kernel functions
++directly without costly hardware privilege-level transitions.
 +
-+Kernel Mode Linux is a technology which enables us to execute user programs
-+in kernel mode. In Kernel Mode Linux, user programs can be executed as
-+user processes that have the privilege level of kernel mode. The benefit
-+of executing user programs in kernel mode is that the user programs can
-+access kernel address space directly.  For example, user programs can invoke
-+system calls very fast because it is unnecessary to switch between a kernel
-+mode and user-mode by using costly software interruptions or context
-+switches. In addition, user programs are executed as ordinary processes
-+(except for their privilege level, of course), so scheduling and paging are
-+performed as usual, unlike kernel modules.
++Supported Architectures
++=======================
 +
-+Although it seems dangerous to let user programs access a kernel directly,
-+safety of the kernel can be ensured by several means: static type checking
-+technology, proof-carrying code technology, software fault isolation, and
-+so forth. For proof of concept, we are developing a system which is based
-+on the combination of Kernel Mode Linux and Typed Assembly Language, TAL.
-+(TAL can ensure safety of programs through its type checking and the type
-+checking can be done at machine binary level. For more information about
-+TAL, see http://www.cs.cornell.edu/talc)
++- ``x86_64`` (Ring 0 via dedicated ``__KML_CS`` 64-bit code segment and IST
++  exception/interrupt stack switching, with ``PREEMPT_RT`` support)
++- ``arm`` (32-bit ARM ``SYSTEM_MODE`` when CPU domains and PAN are disabled)
 +
-+Currently, ARM architecture are supported.
++Usage
++=====
 +
++1. Enable ``CONFIG_KERNEL_MODE_LINUX=y`` (and optionally
++   ``CONFIG_KML_CHECK_CHROOT=y``) in the kernel configuration.
++   On ``x86_64``, ensure ``CONFIG_MITIGATION_PAGE_TABLE_ISOLATION=n`` and
++   ``CONFIG_X86_FRED=n``. On ``arm``, ensure ``CONFIG_ARM_PAN=n``.
++2. Build and boot the kernel.
++3. Place trusted ELF executables in the ``/trusted/`` directory on the root
++   filesystem and invoke them via ``/trusted/<program>``:
 +
-+Instruction:
++   .. code-block:: sh
 +
-+To enable Kernel Mode Linux, say Y in Kernel Mode Linux field of kernel
-+configuration, build and install the kernel, and reboot your machine. Then,
-+all executables under the "/trusted" directory are executed in kernel mode
-+in the current Kernel Mode Linux implementation. For example, to execute a
-+program named "cat" in kernel mode, copy the program to "/trusted" and
-+execute it as follows:
++      # mkdir -p /trusted
++      # cp my_rt_task /trusted/
++      # /trusted/my_rt_task
 +
-+% /trusted/cat
++   Any ELF binary outside ``/trusted/`` (or inside a ``chroot`` environment when
++   ``CONFIG_KML_CHECK_CHROOT=y``) continues to execute in standard unprivileged
++   user mode.
 +
++Implementation Notes
++====================
 +
-+Implementation Notes for ARM:
-+
-+To execute user programs in kernel mode, Kernel Mode Linux has a special
-+start_thread (start_kernel_thread) routine, which is called in processing
-+execve(2) and sets registers of a user process to specified initial values.
-+The start_kernel_thread routine sets the CPSR register as SYSTEM mode and
-+authorize this process the access of the kernel address by set_fs(KERNEL_DS).
-+
-+
-diff --git a/MAINTAINERS b/MAINTAINERS
-index 16dc006..a50736b 100644
---- a/MAINTAINERS
-+++ b/MAINTAINERS
-@@ -6037,6 +6037,12 @@ L:	kernel-janitors@vger.kernel.org
- W:	http://kernelnewbies.org/KernelJanitors
- S:	Odd Fixes
- 
-+KERNEL MODE LINUX
-+P:     Toshiyuki Maeda
-+M:     tosh@is.s.u-tokyo.ac.jp
-+W:     http://www.yl.is.s.u-tokyo.ac.jp/~tosh/kml/
-+S:     Maintained
-+
- KERNEL NFSD, SUNRPC, AND LOCKD SERVERS
- M:	"J. Bruce Fields" <bfields@fieldses.org>
- M:	Jeff Layton <jlayton@poochiereds.net>
-diff --git a/Makefile b/Makefile
-index 9209457..0095a55 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- VERSION = 4
- PATCHLEVEL = 4
- SUBLEVEL = 12
--EXTRAVERSION =
-+EXTRAVERSION = -kml
- NAME = Blurry Fish Butt
- 
- # *DOCUMENTATION*
-diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
-index 79922d2..0a14c7a 100644
---- a/arch/arm/Kconfig
-+++ b/arch/arm/Kconfig
-@@ -2165,6 +2165,10 @@ endmenu
++- **x86_64**: ``load_elf_binary()`` invokes ``start_kernel_thread()`` for
++  trusted binaries under ``/trusted/``, setting ``CS = __KML_CS`` (CPL 0),
++  ``SS = __KERNEL_DS``, and the ``TIF_KU`` thread flag. Hardware interrupts and
++  exceptions use a dedicated IST stack (``IST_INDEX_KML``) so user stacks are
++  never written by the CPU prior to stack switching, and SMEP/SMAP are cleared
++  at boot when KML is enabled.
++- **ARM**: ``start_kernel_thread()`` initializes ``CPSR`` to ``SYSTEM_MODE``
++  (``0x1f``) and sets ``TIF_KU``, while the exception vector stubs route mode
++  ``0xf`` entries to the user-mode handlers.
+diff --git a/Kconfig b/Kconfig
+index 307e58114..c0d90bd54 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -17,6 +17,8 @@ source "mm/Kconfig"
  
  source "net/Kconfig"
  
-+if (MMU && !CPU_USE_DOMAINS)
 +source "kernel/Kconfig.kml"
-+endif
 +
  source "drivers/Kconfig"
  
- source "drivers/firmware/Kconfig"
+ source "fs/Kconfig"
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 782389bd5..47363d2ba 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -14175,6 +14175,14 @@ L:	kernel-janitors@vger.kernel.org
+ S:	Odd Fixes
+ W:	http://kernelnewbies.org/KernelJanitors
+ 
++KERNEL MODE LINUX
++M:	Toshiyuki Maeda <tosh@is.s.u-tokyo.ac.jp>
++S:	Maintained
++W:	http://www.yl.is.s.u-tokyo.ac.jp/~tosh/kml/
++F:	Documentation/admin-guide/kml.rst
++F:	include/linux/kml.h
++F:	kernel/Kconfig.kml
++
+ KERNEL NFSD, SUNRPC, AND LOCKD SERVERS
+ M:	Chuck Lever <cel@kernel.org>
+ M:	Jeff Layton <jlayton@kernel.org>
+diff --git a/Makefile b/Makefile
+index c61ea07ee..302c29860 100644
+--- a/Makefile
++++ b/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 7
+ PATCHLEVEL = 3
+ SUBLEVEL = 0
+-EXTRAVERSION =
++EXTRAVERSION = -kml
+ NAME = Baby Opossum Posse
+ 
+ # *DOCUMENTATION*
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index ffbc7f386..ed8a6fa69 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -42,6 +42,7 @@ config ARM
+ 	select ARCH_SUPPORTS_ATOMIC_RMW
+ 	select ARCH_SUPPORTS_CFI
+ 	select ARCH_SUPPORTS_HUGETLBFS if ARM_LPAE
++	select ARCH_SUPPORTS_KML if MMU && !CPU_USE_DOMAINS && !CPU_SW_DOMAIN_PAN && !CPU_TTBR0_PAN
+ 	select ARCH_SUPPORTS_PER_VMA_LOCK
+ 	select ARCH_SUPPORTS_RT
+ 	select ARCH_USE_BUILTIN_BSWAP
 diff --git a/arch/arm/include/asm/processor.h b/arch/arm/include/asm/processor.h
-index 8a1e8e9..956b53a 100644
+index bba83228b..c8414a6a7 100644
 --- a/arch/arm/include/asm/processor.h
 +++ b/arch/arm/include/asm/processor.h
-@@ -23,6 +23,9 @@
- #include <asm/ptrace.h>
- #include <asm/types.h>
- #include <asm/unified.h>
-+#ifdef CONFIG_KERNEL_MODE_LINUX
-+#include <linux/thread_info.h>
-+#endif
+@@ -49,6 +49,14 @@ static inline void arch_thread_struct_whitelist(unsigned long *offset,
  
- #ifdef __KERNEL__
- #define STACK_TOP	((current->personality & ADDR_LIMIT_32BIT) ? \
-@@ -53,6 +56,14 @@ struct thread_struct {
- #define nommu_start_thread(regs) regs->ARM_r10 = current->mm->start_data
- #endif
+ #define INIT_THREAD  {	}
  
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+static inline void clear_thread_flag_ku(void) { clear_thread_flag(TIF_KU); }
-+static inline void set_thread_flag_ku(void) { set_thread_flag(TIF_KU); }
++#define clear_thread_flag_ku()	clear_thread_flag(TIF_KU)
++#define set_thread_flag_ku()	set_thread_flag(TIF_KU)
 +#else
-+static inline void clear_thread_flag_ku(void) { return; }
-+static inline void set_thread_flag_ku(void) { return; }
++#define clear_thread_flag_ku()	do { } while (0)
++#define set_thread_flag_ku()	do { } while (0)
 +#endif
 +
  #define start_thread(regs,pc,sp)					\
  ({									\
- 	memset(regs->uregs, 0, sizeof(regs->uregs));			\
-@@ -66,7 +77,28 @@ struct thread_struct {
+ 	unsigned long r7, r8, r9;					\
+@@ -77,7 +85,28 @@ static inline void arch_thread_struct_whitelist(unsigned long *offset,
+ 		regs->ARM_cpsr |= PSR_E_BIT;				\
  	regs->ARM_pc = pc & ~1;		/* pc */			\
  	regs->ARM_sp = sp;		/* sp */			\
- 	nommu_start_thread(regs);					\
 +	clear_thread_flag_ku();						\
 +})
 +
 +#ifdef CONFIG_KERNEL_MODE_LINUX
 +#define start_kernel_thread(regs,pc,sp)					\
 +({									\
-+	unsigned long *stack = (unsigned long *)sp;			\
-+	set_fs(KERNEL_DS);						\
 +	memset(regs->uregs, 0, sizeof(regs->uregs));			\
++	if (!IS_ENABLED(CONFIG_MMU))					\
++		regs->ARM_r10 = current->mm->start_data;		\
 +	if (current->personality & ADDR_LIMIT_32BIT)			\
 +		regs->ARM_cpsr = SYSTEM_MODE;				\
 +	else								\
 +		regs->ARM_cpsr = USR26_MODE;				\
 +	if (elf_hwcap & HWCAP_THUMB && pc & 1)				\
 +		regs->ARM_cpsr |= PSR_T_BIT;				\
-+	regs->ARM_cpsr |= PSR_ENDSTATE;					\
++	if (IS_ENABLED(CONFIG_CPU_ENDIAN_BE8))				\
++		regs->ARM_cpsr |= PSR_E_BIT;				\
 +	regs->ARM_pc = pc & ~1;		/* pc */			\
 +	regs->ARM_sp = sp;		/* sp */			\
-+	nommu_start_thread(regs);					\
 +	set_thread_flag_ku();						\
  })
 +#endif
@@ -217,18 +257,19 @@ index 8a1e8e9..956b53a 100644
  /* Forward declaration, a strange C thing */
  struct task_struct;
 diff --git a/arch/arm/include/asm/ptrace.h b/arch/arm/include/asm/ptrace.h
-index 51622ba..6c40084 100644
+index 6eb311fb2..315573209 100644
 --- a/arch/arm/include/asm/ptrace.h
 +++ b/arch/arm/include/asm/ptrace.h
-@@ -17,8 +17,15 @@ struct pt_regs {
- 	unsigned long uregs[18];
- };
+@@ -25,8 +25,16 @@ struct svc_pt_regs {
+ 
+ #define to_svc_pt_regs(r) container_of(r, struct svc_pt_regs, regs)
  
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+static inline int test_thread_flag_ku(void);
++bool arm_test_thread_flag_ku(void);
 +
-+#define user_mode(regs)	\
-+	((((regs)->ARM_cpsr & 0xf) == 0) || ((((regs)->ARM_cpsr & 0xf) == 0xf) && test_thread_flag_ku()))
++#define user_mode(regs) \
++	((((regs)->ARM_cpsr & 0xf) == 0) || \
++	 ((((regs)->ARM_cpsr & 0xf) == 0xf) && arm_test_thread_flag_ku()))
 +#else
  #define user_mode(regs)	\
  	(((regs)->ARM_cpsr & 0xf) == 0)
@@ -236,62 +277,92 @@ index 51622ba..6c40084 100644
  
  #ifdef CONFIG_ARM_THUMB
  #define thumb_mode(regs) \
-@@ -60,6 +67,10 @@ static inline int valid_user_regs(struct pt_regs *regs)
+@@ -68,6 +76,10 @@ static inline int valid_user_regs(struct pt_regs *regs)
  	if ((regs->ARM_cpsr & PSR_I_BIT) == 0) {
  		if (mode == USR_MODE)
  			return 1;
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+		if (mode == SYSTEM_MODE && test_thread_flag_ku())
++		if (mode == SYSTEM_MODE && arm_test_thread_flag_ku())
 +			return 1;
-+#endif /* CONFIG_KERNEL_MODE_LINUX */
++#endif
  		if (elf_hwcap & HWCAP_26BIT && mode == USR26_MODE)
  			return 1;
  	}
 diff --git a/arch/arm/include/asm/thread_info.h b/arch/arm/include/asm/thread_info.h
-index 1f36a4e..159ba52 100644
+index 943ffcf06..3f9712037 100644
 --- a/arch/arm/include/asm/thread_info.h
 +++ b/arch/arm/include/asm/thread_info.h
-@@ -150,6 +150,9 @@ extern int vfp_restore_user_hwstate(struct user_vfp __user *,
- #define TIF_USING_IWMMXT	17
- #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
- #define TIF_RESTORE_SIGMASK	20
+@@ -152,6 +152,9 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+ #define TIF_SYSCALL_AUDIT	21	/* syscall auditing active */
+ #define TIF_SYSCALL_TRACEPOINT	22	/* syscall tracepoint instrumentation */
+ #define TIF_SECCOMP		23	/* seccomp syscall filtering active */
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+#define TIF_KU			23
-+#endif /* CONFIG_KERNEL_MODE_LINUX */
++#define TIF_KU			24	/* Kernel Mode Linux user task */
++#endif
+ 
  
  #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
- #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
-@@ -161,6 +164,9 @@ extern int vfp_restore_user_hwstate(struct user_vfp __user *,
- #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+@@ -164,6 +167,9 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
  #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+ #define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
  #define _TIF_USING_IWMMXT	(1 << TIF_USING_IWMMXT)
 +#ifdef CONFIG_KERNEL_MODE_LINUX
 +#define _TIF_KU			(1 << TIF_KU)
-+#endif /* CONFIG_KERNEL_MODE_LINUX */
++#endif
  
  /* Checks for any syscall work in entry-common.S */
  #define _TIF_SYSCALL_WORK (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | \
-@@ -173,5 +179,15 @@ extern int vfp_restore_user_hwstate(struct user_vfp __user *,
- 				 _TIF_NOTIFY_RESUME | _TIF_UPROBE | \
- 				 _TIF_NEED_RESCHED_LAZY)
+diff --git a/arch/arm/include/asm/uaccess.h b/arch/arm/include/asm/uaccess.h
+index 1593cf3b9..717c53c58 100644
+--- a/arch/arm/include/asm/uaccess.h
++++ b/arch/arm/include/asm/uaccess.h
+@@ -108,6 +108,11 @@ static inline void __user *__uaccess_mask_range_ptr(const void __user *ptr,
+ 	void __user *safe_ptr = (void __user *)ptr;
+ 	unsigned long tmp;
  
-+#ifndef __ASSEMBLY__
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+static inline int test_ti_thread_flag(struct thread_info *ti, int flag);
-+static inline int test_thread_flag_ku(void)
-+{
-+	return test_ti_thread_flag(current_thread_info(), TIF_KU);
-+}
-+#endif /* CONFIG_KERNEL_MODE_LINUX */
-+#endif /* __ASSEMBLY__ */
++	if (unlikely(arm_test_thread_flag_ku()))
++		return safe_ptr;
++#endif
 +
- #endif /* __KERNEL__ */
- #endif /* __ASM_ARM_THREAD_INFO_H */
+ 	asm volatile(
+ 	"	.syntax unified\n"
+ 	"	sub	%1, %3, #1\n"
+@@ -183,10 +188,14 @@ extern int __get_user_64t_4(void *);
+ 		unsigned long __limit = TASK_SIZE - 1; \
+ 		register typeof(*(p)) __user *__p asm("r0") = (p);	\
+ 		register __inttype(x) __r2 asm("r2");			\
+-		register unsigned long __l asm("r1") = __limit;		\
++		register unsigned long __l asm("r1");			\
+ 		register int __e asm("r0");				\
+ 		unsigned int __ua_flags = uaccess_save_and_enable();	\
+ 		int __tmp_e;						\
++		if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&		\
++		    unlikely(arm_test_thread_flag_ku()))		\
++			__limit = ~0UL;					\
++		__l = __limit;						\
+ 		switch (sizeof(*(__p))) {				\
+ 		case 1:							\
+ 			if (sizeof((x)) >= 8)				\
+@@ -236,8 +245,12 @@ extern int __put_user_8(void *, unsigned long long);
+ 		unsigned long __limit = TASK_SIZE - 1; \
+ 		register typeof(__pu_val) __r2 asm("r2") = __pu_val;	\
+ 		register const void __user *__p asm("r0") = __ptr;	\
+-		register unsigned long __l asm("r1") = __limit;		\
++		register unsigned long __l asm("r1");			\
+ 		register int __e asm("r0");				\
++		if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&		\
++		    unlikely(arm_test_thread_flag_ku()))		\
++			__limit = ~0UL;					\
++		__l = __limit;						\
+ 		__asm__ __volatile__ (					\
+ 			__asmeq("%0", "r0") __asmeq("%2", "r2")		\
+ 			__asmeq("%3", "r1")				\
 diff --git a/arch/arm/kernel/entry-armv.S b/arch/arm/kernel/entry-armv.S
-index d66b1ae..faa1ced 100644
+index 2d2ea3ca8..7dfaedfce 100644
 --- a/arch/arm/kernel/entry-armv.S
 +++ b/arch/arm/kernel/entry-armv.S
-@@ -1103,7 +1103,11 @@ vector_rst:
+@@ -973,7 +973,11 @@ vector_rst:
  	.long	__irq_invalid			@  c
  	.long	__irq_invalid			@  d
  	.long	__irq_invalid			@  e
@@ -303,7 +374,7 @@ index d66b1ae..faa1ced 100644
  
  /*
   * Data abort dispatcher
-@@ -1126,7 +1130,11 @@ vector_rst:
+@@ -996,7 +1000,11 @@ vector_rst:
  	.long	__dabt_invalid			@  c
  	.long	__dabt_invalid			@  d
  	.long	__dabt_invalid			@  e
@@ -315,7 +386,7 @@ index d66b1ae..faa1ced 100644
  
  /*
   * Prefetch abort dispatcher
-@@ -1149,7 +1157,11 @@ vector_rst:
+@@ -1019,7 +1027,11 @@ vector_rst:
  	.long	__pabt_invalid			@  c
  	.long	__pabt_invalid			@  d
  	.long	__pabt_invalid			@  e
@@ -327,7 +398,16 @@ index d66b1ae..faa1ced 100644
  
  /*
   * Undef instr entry dispatcher
-@@ -1172,7 +1184,11 @@ vector_rst:
+@@ -1029,7 +1041,7 @@ vector_rst:
+ 
+ 	.long	__und_usr			@  0 (USR_26 / USR_32)
+ 	.long	__und_invalid			@  1 (FIQ_26 / FIQ_32)
+-	.long	__und_invalid			@  2 (IRQ_26 / IRQ_32)
++	.long	__und_invalid			@  2 (IRQ_26 / FIQ_32)
+ 	.long	__und_svc			@  3 (SVC_26 / SVC_32)
+ 	.long	__und_invalid			@  4
+ 	.long	__und_invalid			@  5
+@@ -1042,7 +1054,11 @@ vector_rst:
  	.long	__und_invalid			@  c
  	.long	__und_invalid			@  d
  	.long	__und_invalid			@  e
@@ -339,343 +419,993 @@ index d66b1ae..faa1ced 100644
  
  	.align	5
  
-diff --git a/arch/arm/lib/uaccess_with_memcpy.c b/arch/arm/lib/uaccess_with_memcpy.c
-index 588bbc2..7db89ea 100644
---- a/arch/arm/lib/uaccess_with_memcpy.c
-+++ b/arch/arm/lib/uaccess_with_memcpy.c
-@@ -90,9 +90,13 @@ __copy_to_user_memcpy(void __user *to, const void *from, unsigned long n)
- {
- 	unsigned long ua_flags;
- 	int atomic;
--
-+#ifndef CONFIG_KERNEL_MODE_LINUX
- 	if (unlikely(segment_eq(get_fs(), KERNEL_DS))) {
-+#elif
-+	if (unlikely(segment_eq(get_fs(), KERNEL_DS) && !test_thread_flag(TIF_KU))) {
-+#endif
- 		memcpy((void *)to, from, n);
-+
- 		return 0;
- 	}
- 
-@@ -163,7 +167,13 @@ __clear_user_memset(void __user *addr, unsigned long n)
- {
- 	unsigned long ua_flags;
- 
-+#ifndef CONFIG_KERNEL_MODE_LINUX
- 	if (unlikely(segment_eq(get_fs(), KERNEL_DS))) {
-+#else
-+	if (unlikely(segment_eq(get_fs(), KERNEL_DS) &&
-+			     !test_thread_flag(TIF_KU))) {
-+#endif
-+
- 		memset((void *)addr, 0, n);
- 		return 0;
- 	}
-diff --git a/arch/arm/vfp/vfphw.S b/arch/arm/vfp/vfphw.S
-index f74a8f7..69cdb2f 100644
---- a/arch/arm/vfp/vfphw.S
-+++ b/arch/arm/vfp/vfphw.S
-@@ -84,8 +84,21 @@ ENTRY(vfp_support_entry)
- 	ldr	r3, [sp, #S_PSR]	@ Neither lazy restore nor FP exceptions
- 	and	r3, r3, #MODE_MASK	@ are supported in kernel mode
- 	teq	r3, #USR_MODE
-+#ifndef CONFIG_KERNEL_MODE_LINUX
- 	bne	vfp_kmode_exception	@ Returns through lr
-+#elseif
-+	beq	vfp_user_mode
-+	teq	r3, #SYSTEM_MODE
-+	bne	vfp_kmode_exception
-+	get_thread_info r3
-+	ldr	r3, [r3, #TI_FLAGS]
-+	tst	r3, #_TIF_KU
-+	beq	vfp_kmode_exception
-+#endif
+diff --git a/arch/arm/kernel/process.c b/arch/arm/kernel/process.c
+index d7aa95225..f74df45a2 100644
+--- a/arch/arm/kernel/process.c
++++ b/arch/arm/kernel/process.c
+@@ -51,6 +51,14 @@ asmlinkage struct task_struct *__current;
+ EXPORT_SYMBOL(__current);
+ #endif
  
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+vfp_user_mode:
++bool noinstr arm_test_thread_flag_ku(void)
++{
++	return (READ_ONCE(current_thread_info()->flags) & _TIF_KU) != 0;
++}
++EXPORT_SYMBOL(arm_test_thread_flag_ku);
 +#endif
- 	VFPFMRX	r1, FPEXC		@ Is the VFP enabled?
- 	DBGSTR1	"fpexc %08x", r1
- 	tst	r1, #FPEXC_EN
-diff --git a/drivers/pnp/pnpbios/bioscalls.c b/drivers/pnp/pnpbios/bioscalls.c
-index 438d4c7..776720e 100644
---- a/drivers/pnp/pnpbios/bioscalls.c
-+++ b/drivers/pnp/pnpbios/bioscalls.c
-@@ -86,6 +86,7 @@ static inline u16 call_pnp_bios(u16 func, u16 arg1, u16 arg2, u16 arg3,
- 	u16 status;
- 	struct desc_struct save_desc_40;
- 	int cpu;
-+	NMI_DECLS_GS
++
+ static const char *processor_modes[] __maybe_unused = {
+   "USER_26", "FIQ_26" , "IRQ_26" , "SVC_26" , "UK4_26" , "UK5_26" , "UK6_26" , "UK7_26" ,
+   "UK8_26" , "UK9_26" , "UK10_26", "UK11_26", "UK12_26", "UK13_26", "UK14_26", "UK15_26",
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 15fd9ec5e..8d867090a 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -128,6 +128,7 @@ config X86
+ 	select ARCH_HAS_PTE_PROTNONE		if X86_64
+ 	select ARCH_SUPPORTS_NUMA_BALANCING	if X86_64
+ 	select ARCH_SUPPORTS_KMAP_LOCAL_FORCE_MAP	if NR_CPUS <= 4096
++	select ARCH_SUPPORTS_KML		if X86_64 && !MITIGATION_PAGE_TABLE_ISOLATION && !X86_FRED && !XEN_PV
+ 	select ARCH_SUPPORTS_CFI		if X86_64
+ 	select ARCH_SUPPORTS_CMDLINE_FROM_BOOTCONFIG
+ 	select ARCH_USES_CFI_TRAPS		if X86_64 && CFI
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index 253f0a585..de0fc580b 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -351,6 +351,13 @@ SYM_CODE_START(\asmsym)
+ 		 */
+ 		testb	$3, CS-ORIG_RAX(%rsp)
+ 		jnz	.Lfrom_usermode_no_gap_\@
++#ifdef CONFIG_KERNEL_MODE_LINUX
++		cmpw	$__KML_CS, CS-ORIG_RAX(%rsp)
++		jne	.Lbp_from_kernel_\@
++		testb	$0x80, (RSP-ORIG_RAX+7)(%rsp)
++		jz	.Lfrom_usermode_no_gap_\@
++.Lbp_from_kernel_\@:
++#endif
+ 		.rept	6
+ 		pushq	5*8(%rsp)
+ 		.endr
+@@ -409,6 +416,13 @@ SYM_CODE_START(\asmsym)
+ 	 */
+ 	testb	$3, CS-ORIG_RAX(%rsp)
+ 	jnz	.Lfrom_usermode_switch_stack_\@
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	cmpw	$__KML_CS, CS-ORIG_RAX(%rsp)
++	jne	.Lmce_db_from_kernel_\@
++	testb	$0x80, (RSP-ORIG_RAX+7)(%rsp)
++	jz	.Lfrom_usermode_switch_stack_\@
++.Lmce_db_from_kernel_\@:
++#endif
+ 
+ 	/* paranoid_entry returns GS information for paranoid_exit in EBX. */
+ 	call	paranoid_entry
+@@ -464,6 +478,13 @@ SYM_CODE_START(\asmsym)
+ 	 */
+ 	testb	$3, CS-ORIG_RAX(%rsp)
+ 	jnz	.Lfrom_usermode_switch_stack_\@
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	cmpw	$__KML_CS, CS-ORIG_RAX(%rsp)
++	jne	.Lmce_db_from_kernel_\@
++	testb	$0x80, (RSP-ORIG_RAX+7)(%rsp)
++	jz	.Lfrom_usermode_switch_stack_\@
++.Lmce_db_from_kernel_\@:
++#endif
  
  	/*
- 	 * PnP BIOSes are generally not terribly re-entrant.
-@@ -95,6 +96,8 @@ static inline u16 call_pnp_bios(u16 func, u16 arg1, u16 arg2, u16 arg3,
- 		return PNP_FUNCTION_NOT_SUPPORTED;
- 
- 	cpu = get_cpu();
-+
-+	NMI_SAVE_GS;
- 	save_desc_40 = get_cpu_gdt_table(cpu)[0x40 / 8];
- 	get_cpu_gdt_table(cpu)[0x40 / 8] = bad_bios_desc;
- 
-@@ -135,6 +138,7 @@ static inline u16 call_pnp_bios(u16 func, u16 arg1, u16 arg2, u16 arg3,
- 	spin_unlock_irqrestore(&pnp_bios_lock, flags);
- 
- 	get_cpu_gdt_table(cpu)[0x40 / 8] = save_desc_40;
-+	NMI_RESTORE_GS;
- 	put_cpu();
- 
- 	/* If we get here and this is set then the PnP BIOS faulted on us. */
-diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
-index 3a93755..60aaae2 100644
---- a/fs/binfmt_elf.c
-+++ b/fs/binfmt_elf.c
-@@ -9,6 +9,10 @@
-  * Copyright 1993, 1994: Eric Youngdale (ericy@cais.com).
-  */
- 
-+#if defined(CONFIG_KERNEL_MODE_LINUX) && defined(INCLUDED_FOR_COMPAT)
-+#undef CONFIG_KERNEL_MODE_LINUX
-+#endif
-+
- #include <linux/module.h>
- #include <linux/kernel.h>
- #include <linux/fs.h>
-@@ -149,7 +153,11 @@ static int padzero(unsigned long elf_bss)
- 
- static int
- create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
--		unsigned long load_addr, unsigned long interp_load_addr)
-+		unsigned long load_addr, unsigned long interp_load_addr
+ 	 * paranoid_entry returns SWAPGS flag for paranoid_exit in EBX.
+@@ -574,9 +595,16 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
+ .Lswapgs_and_iret:
+ 	swapgs
+ 	CLEAR_CPU_BUFFERS
+-	/* Assert that the IRET frame indicates user mode. */
++	/* Assert that the IRET frame indicates user mode (or KML Ring-0 user mode). */
+ 	testb	$3, 8(%rsp)
+ 	jnz	.Lnative_iret
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+		, int kernel_mode
++	cmpw	$__KML_CS, 8(%rsp)
++	jne	1f
++	testb	$0x80, (24+7)(%rsp)
++	jz	.Lnative_iret
++1:
 +#endif
-+)
+ 	ud2
+ 
+ #ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
+@@ -1011,7 +1039,14 @@ SYM_CODE_START(error_entry)
+ 	ENCODE_FRAME_POINTER 8
+ 
+ 	testb	$3, CS+8(%rsp)
+-	jz	.Lerror_kernelspace
++	jnz	.Lerror_from_usermode
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	cmpw	$__KML_CS, CS+8(%rsp)
++	jne	.Lerror_kernelspace
++	testb	$0x80, (RSP+8+7)(%rsp)
++	jnz	.Lerror_kernelspace
++#endif
++.Lerror_from_usermode:
+ 
+ 	/*
+ 	 * We entered from user mode or we're pretending to have entered
+@@ -1063,8 +1098,13 @@ SYM_CODE_START(error_entry)
+ .Lerror_entry_done_lfence:
+ 	FENCE_SWAPGS_KERNEL_ENTRY
+ 	CALL_DEPTH_ACCOUNT
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	leaq	8(%rsp), %rdi			/* arg0 = pt_regs pointer */
++	jmp	kml_switch_off_ist
++#else
+ 	leaq	8(%rsp), %rax			/* return pt_regs pointer */
+ 	RET
++#endif
+ 
+ .Lbstep_iret:
+ 	/* Fix truncated RIP */
+@@ -1096,8 +1136,14 @@ SYM_CODE_START_LOCAL(error_return)
+ 	UNWIND_HINT_REGS
+ 	DEBUG_ENTRY_ASSERT_IRQS_OFF
+ 	testb	$3, CS(%rsp)
+-	jz	restore_regs_and_return_to_kernel
+-	jmp	swapgs_restore_regs_and_return_to_usermode
++	jnz	swapgs_restore_regs_and_return_to_usermode
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	cmpw	$__KML_CS, CS(%rsp)
++	jne	restore_regs_and_return_to_kernel
++	testb	$0x80, (RSP+7)(%rsp)
++	jz	swapgs_restore_regs_and_return_to_usermode
++#endif
++	jmp	restore_regs_and_return_to_kernel
+ SYM_CODE_END(error_return)
+ 
+ /*
+@@ -1157,7 +1203,14 @@ SYM_CODE_START(asm_exc_nmi)
+ 	pushq	%rdx
+ 
+ 	testb	$3, CS-RIP+8(%rsp)
+-	jz	.Lnmi_from_kernel
++	jnz	.Lnmi_from_usermode
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	cmpw	$__KML_CS, CS-RIP+8(%rsp)
++	jne	.Lnmi_from_kernel
++	testb	$0x80, (RSP-RIP+8+7)(%rsp)
++	jnz	.Lnmi_from_kernel
++#endif
++.Lnmi_from_usermode:
+ 
+ 	/*
+ 	 * NMI from user mode.  We need to run on the thread stack, but we
+diff --git a/arch/x86/entry/syscall_64.c b/arch/x86/entry/syscall_64.c
+index 966d3d1b7..472a53e55 100644
+--- a/arch/x86/entry/syscall_64.c
++++ b/arch/x86/entry/syscall_64.c
+@@ -78,6 +78,12 @@ static __always_inline void do_syscall_x32(struct pt_regs *regs, unsigned long n
+ /* Returns true to return using SYSRET, or false to use IRET */
+ __visible noinstr bool do_syscall_64(struct pt_regs *regs, long nr)
  {
- 	unsigned long p = bprm->p;
- 	int argc = bprm->argc;
-@@ -662,8 +670,45 @@ static unsigned long randomize_stack_top(unsigned long stack_top)
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (unlikely(test_thread_flag(TIF_KU))) {
++		regs->cs = __KML_CS;
++		regs->ss = __KERNEL_DS;
++	}
++#endif
+ 	if (likely(syscall_enter_from_user_mode_randomize_stack(regs, &nr))) {
+ 		instrumentation_begin();
+ 
+diff --git a/arch/x86/include/asm/cpu_entry_area.h b/arch/x86/include/asm/cpu_entry_area.h
+index 462fc34f1..51b06e2d1 100644
+--- a/arch/x86/include/asm/cpu_entry_area.h
++++ b/arch/x86/include/asm/cpu_entry_area.h
+@@ -16,8 +16,14 @@
+ #define VC_EXCEPTION_STKSZ	0
  #endif
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define KML_EXCEPTION_STKSZ	EXCEPTION_STKSZ
++#else
++#define KML_EXCEPTION_STKSZ	0
++#endif
++
+ /* Macro to enforce the same ordering and stack sizes */
+-#define ESTACKS_MEMBERS(guardsize, optional_stack_size)		\
++#define ESTACKS_MEMBERS(guardsize, optional_stack_size, kml_stack_size)	\
+ 	char	DF_stack_guard[guardsize];			\
+ 	char	DF_stack[EXCEPTION_STKSZ];			\
+ 	char	NMI_stack_guard[guardsize];			\
+@@ -30,16 +36,18 @@
+ 	char	VC_stack[optional_stack_size];			\
+ 	char	VC2_stack_guard[guardsize];			\
+ 	char	VC2_stack[optional_stack_size];			\
++	char	KML_stack_guard[guardsize];			\
++	char	KML_stack[kml_stack_size];			\
+ 	char	IST_top_guard[guardsize];			\
+ 
+ /* The exception stacks' physical storage. No guard pages required */
+ struct exception_stacks {
+-	ESTACKS_MEMBERS(0, VC_EXCEPTION_STKSZ)
++	ESTACKS_MEMBERS(0, VC_EXCEPTION_STKSZ, KML_EXCEPTION_STKSZ)
+ };
+ 
+ /* The effective cpu entry area mapping with guard pages. */
+ struct cea_exception_stacks {
+-	ESTACKS_MEMBERS(PAGE_SIZE, EXCEPTION_STKSZ)
++	ESTACKS_MEMBERS(PAGE_SIZE, EXCEPTION_STKSZ, EXCEPTION_STKSZ)
+ };
+ 
+ /*
+@@ -52,6 +60,7 @@ enum exception_stack_ordering {
+ 	ESTACK_MCE,
+ 	ESTACK_VC,
+ 	ESTACK_VC2,
++	ESTACK_KML,
+ 	N_EXCEPTION_STACKS
+ };
+ 
+diff --git a/arch/x86/include/asm/page_64_types.h b/arch/x86/include/asm/page_64_types.h
+index 7400dab37..f173bcd60 100644
+--- a/arch/x86/include/asm/page_64_types.h
++++ b/arch/x86/include/asm/page_64_types.h
+@@ -29,6 +29,7 @@
+ #define	IST_INDEX_DB		2
+ #define	IST_INDEX_MCE		3
+ #define	IST_INDEX_VC		4
++#define	IST_INDEX_KML		5
+ 
+ /*
+  * Set __PAGE_OFFSET to the most negative possible address +
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index ec9db0dfa..05b7548e7 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -687,6 +687,10 @@ extern unsigned long __top_init_kernel_stack[];
+ 
+ extern void start_thread(struct pt_regs *regs, unsigned long new_ip,
+ 					       unsigned long new_sp);
++#ifdef CONFIG_KERNEL_MODE_LINUX
++extern void start_kernel_thread(struct pt_regs *regs, unsigned long new_ip,
++				unsigned long new_sp);
++#endif
+ 
+ /*
+  * This decides where the kernel will search for a free chunk of vm
+diff --git a/arch/x86/include/asm/ptrace.h b/arch/x86/include/asm/ptrace.h
+index 7bb7bd903..bcc47750f 100644
+--- a/arch/x86/include/asm/ptrace.h
++++ b/arch/x86/include/asm/ptrace.h
+@@ -210,6 +210,8 @@ static __always_inline int user_mode(struct pt_regs *regs)
+ {
+ #ifdef CONFIG_X86_32
+ 	return ((regs->cs & SEGMENT_RPL_MASK) | (regs->flags & X86_VM_MASK)) >= USER_RPL;
++#elif defined(CONFIG_KERNEL_MODE_LINUX)
++	return !!(regs->cs & 3) || (regs->cs == __KML_CS && (long)regs->sp >= 0);
+ #else
+ 	return !!(regs->cs & 3);
+ #endif
+@@ -227,6 +229,10 @@ static __always_inline int v8086_mode(struct pt_regs *regs)
+ static inline bool user_64bit_mode(struct pt_regs *regs)
+ {
+ #ifdef CONFIG_X86_64
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (regs->cs == __KML_CS && (long)regs->sp >= 0)
++		return true;
++#endif
+ #ifndef CONFIG_PARAVIRT_XXL
+ 	/*
+ 	 * On non-paravirt systems, this is the only long mode CPL 3
+diff --git a/arch/x86/include/asm/segment.h b/arch/x86/include/asm/segment.h
+index dbd90fede..bc021d5f3 100644
+--- a/arch/x86/include/asm/segment.h
++++ b/arch/x86/include/asm/segment.h
+@@ -187,6 +187,9 @@
+ #define GDT_ENTRY_DEFAULT_USER32_CS	4
+ #define GDT_ENTRY_DEFAULT_USER_DS	5
+ #define GDT_ENTRY_DEFAULT_USER_CS	6
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define GDT_ENTRY_KML_CS		7
++#endif
+ 
+ /* Needs two entries */
+ #define GDT_ENTRY_TSS			8
+@@ -215,6 +218,9 @@
+ #define __USER32_CS			(GDT_ENTRY_DEFAULT_USER32_CS*8 + 3)
+ #define __USER_DS			(GDT_ENTRY_DEFAULT_USER_DS*8 + 3)
+ #define __USER_CS			(GDT_ENTRY_DEFAULT_USER_CS*8 + 3)
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define __KML_CS			(GDT_ENTRY_KML_CS*8)
++#endif
+ #define __CPUNODE_SEG			(GDT_ENTRY_CPUNODE*8 + 3)
+ 
+ #endif
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index 0067684af..b7a443564 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -101,6 +101,9 @@ struct thread_info {
+ #define TIF_SINGLESTEP		25	/* reenable singlestep on user return*/
+ #define TIF_BLOCKSTEP		26	/* set when we want DEBUGCTLMSR_BTF */
+ #define TIF_ADDR32		27	/* 32-bit address space on 64 bits */
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define TIF_KU			28	/* Kernel Mode Linux user task */
++#endif
+ 
+ #define _TIF_SSBD		BIT(TIF_SSBD)
+ #define _TIF_SPEC_IB		BIT(TIF_SPEC_IB)
+@@ -114,6 +117,9 @@ struct thread_info {
+ #define _TIF_BLOCKSTEP		BIT(TIF_BLOCKSTEP)
+ #define _TIF_SINGLESTEP		BIT(TIF_SINGLESTEP)
+ #define _TIF_ADDR32		BIT(TIF_ADDR32)
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define _TIF_KU			BIT(TIF_KU)
++#endif
+ 
+ /* flags to check in __switch_to() */
+ #define _TIF_WORK_CTXSW_BASE					\
+diff --git a/arch/x86/include/asm/traps.h b/arch/x86/include/asm/traps.h
+index 3f24cc472..053f25779 100644
+--- a/arch/x86/include/asm/traps.h
++++ b/arch/x86/include/asm/traps.h
+@@ -12,6 +12,9 @@
+ 
+ #ifdef CONFIG_X86_64
+ asmlinkage __visible notrace struct pt_regs *sync_regs(struct pt_regs *eregs);
++#ifdef CONFIG_KERNEL_MODE_LINUX
++asmlinkage __visible noinstr struct pt_regs *kml_switch_off_ist(struct pt_regs *eregs);
++#endif
+ asmlinkage __visible notrace
+ struct pt_regs *fixup_bad_iret(struct pt_regs *bad_regs);
+ asmlinkage __visible noinstr struct pt_regs *vc_switch_off_ist(struct pt_regs *eregs);
+diff --git a/arch/x86/include/asm/uaccess_64.h b/arch/x86/include/asm/uaccess_64.h
+index 20de34cc9..cbd3f390c 100644
+--- a/arch/x86/include/asm/uaccess_64.h
++++ b/arch/x86/include/asm/uaccess_64.h
+@@ -12,6 +12,9 @@
+ #include <asm/cpufeatures.h>
+ #include <asm/page.h>
+ #include <asm/percpu.h>
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#include <linux/thread_info.h>
++#endif
+ 
+ #ifdef MODULE
+   #define runtime_const_ptr(sym) (sym)
+@@ -64,6 +67,10 @@ static inline unsigned long __untagged_addr_remote(struct mm_struct *mm,
+ static inline void __user *mask_user_address(const void __user *ptr)
+ {
+ 	void __user *ret;
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (unlikely(test_thread_flag(TIF_KU)))
++		return (void __user *)ptr;
++#endif
+ 	asm("cmp %1,%0\n\t"
+ 	    "cmova %1,%0"
+ 		:"=r" (ret)
+@@ -97,6 +104,10 @@ static inline void __user *mask_user_address(const void __user *ptr)
+  */
+ static inline bool __access_ok(const void __user *ptr, unsigned long size)
+ {
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (unlikely(test_thread_flag(TIF_KU)))
++		return true;
++#endif
+ 	if (__builtin_constant_p(size <= PAGE_SIZE) && size <= PAGE_SIZE) {
+ 		return valid_user_address(ptr);
+ 	} else {
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index c7352827f..5130cf5f4 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -224,6 +224,9 @@ DEFINE_PER_CPU_PAGE_ALIGNED(struct gdt_page, gdt_page) = { .gdt = {
+ 	[GDT_ENTRY_DEFAULT_USER32_CS]	= GDT_ENTRY_INIT(DESC_CODE32 | DESC_USER, 0, 0xfffff),
+ 	[GDT_ENTRY_DEFAULT_USER_DS]	= GDT_ENTRY_INIT(DESC_DATA64 | DESC_USER, 0, 0xfffff),
+ 	[GDT_ENTRY_DEFAULT_USER_CS]	= GDT_ENTRY_INIT(DESC_CODE64 | DESC_USER, 0, 0xfffff),
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	[GDT_ENTRY_KML_CS]		= GDT_ENTRY_INIT(DESC_CODE64, 0, 0xfffff),
++#endif
+ #else
+ 	[GDT_ENTRY_KERNEL_CS]		= GDT_ENTRY_INIT(DESC_CODE32, 0, 0xfffff),
+ 	[GDT_ENTRY_KERNEL_DS]		= GDT_ENTRY_INIT(DESC_DATA32, 0, 0xfffff),
+@@ -371,6 +374,11 @@ static inline void squash_the_stupid_serial_number(struct cpuinfo_x86 *c)
+ 
+ static __always_inline void setup_smep(struct cpuinfo_x86 *c)
+ {
++	if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX)) {
++		setup_clear_cpu_cap(X86_FEATURE_SMEP);
++		cr4_clear_bits(X86_CR4_SMEP);
++		return;
++	}
+ 	if (cpu_has(c, X86_FEATURE_SMEP))
+ 		cr4_set_bits(X86_CR4_SMEP);
+ }
+@@ -382,6 +390,11 @@ static __always_inline void setup_smap(struct cpuinfo_x86 *c)
+ 	/* This should have been cleared long ago */
+ 	BUG_ON(eflags & X86_EFLAGS_AC);
+ 
++	if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX)) {
++		setup_clear_cpu_cap(X86_FEATURE_SMAP);
++		cr4_clear_bits(X86_CR4_SMAP);
++		return;
++	}
+ 	if (cpu_has(c, X86_FEATURE_SMAP))
+ 		cr4_set_bits(X86_CR4_SMAP);
+ }
+@@ -2390,6 +2403,9 @@ static inline void tss_setup_ist(struct tss_struct *tss)
+ 	tss->x86_tss.ist[IST_INDEX_MCE] = __this_cpu_ist_top_va(MCE);
+ 	/* Only mapped when SEV-ES is active */
+ 	tss->x86_tss.ist[IST_INDEX_VC] = __this_cpu_ist_top_va(VC);
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	tss->x86_tss.ist[IST_INDEX_KML] = __this_cpu_ist_top_va(KML);
++#endif
+ }
+ #else /* CONFIG_X86_64 */
+ static inline void tss_setup_ist(struct tss_struct *tss) { }
+diff --git a/arch/x86/kernel/dumpstack_64.c b/arch/x86/kernel/dumpstack_64.c
+index 6c5defd65..998c17f14 100644
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@ -26,11 +26,12 @@ static const char * const exception_stack_names[] = {
+ 		[ ESTACK_MCE	]	= "#MC",
+ 		[ ESTACK_VC	]	= "#VC",
+ 		[ ESTACK_VC2	]	= "#VC2",
++		[ ESTACK_KML	]	= "KML",
+ };
+ 
+ const char *stack_type_name(enum stack_type type)
+ {
+-	BUILD_BUG_ON(N_EXCEPTION_STACKS != 6);
++	BUILD_BUG_ON(N_EXCEPTION_STACKS != 7);
+ 
+ 	if (type == STACK_TYPE_TASK)
+ 		return "TASK";
+@@ -89,6 +90,7 @@ struct estack_pages estack_pages[CEA_ESTACK_PAGES] ____cacheline_aligned = {
+ 	EPAGERANGE(MCE),
+ 	EPAGERANGE(VC),
+ 	EPAGERANGE(VC2),
++	EPAGERANGE(KML),
+ };
+ 
+ static __always_inline bool in_exception_stack(unsigned long *stack, struct stack_info *info)
+@@ -98,7 +100,7 @@ static __always_inline bool in_exception_stack(unsigned long *stack, struct stac
+ 	struct pt_regs *regs;
+ 	unsigned int k;
+ 
+-	BUILD_BUG_ON(N_EXCEPTION_STACKS != 6);
++	BUILD_BUG_ON(N_EXCEPTION_STACKS != 7);
+ 
+ 	begin = (unsigned long)__this_cpu_read(cea_exception_stacks);
+ 	/*
+diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+index 90a22e24a..6ed4b844a 100644
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -18,6 +18,12 @@
+ 
+ #define DEFAULT_STACK	0
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define KML_STACK	(IST_INDEX_KML + 1)
++#else
++#define KML_STACK	DEFAULT_STACK
++#endif
++
+ #define G(_vector, _addr, _ist, _type, _dpl, _segment)	\
+ 	{						\
+ 		.vector		= _vector,		\
+@@ -37,6 +43,13 @@
+ #define SYSG(_vector, _addr)				\
+ 	G(_vector, _addr, DEFAULT_STACK, GATE_INTERRUPT, DPL3, __KERNEL_CS)
+ 
++/* KML-aware interrupt/system gates (use IST_INDEX_KML once TSS is initialized) */
++#define KML_INTG(_vector, _addr)			\
++	G(_vector, _addr, KML_STACK, GATE_INTERRUPT, DPL0, __KERNEL_CS)
++
++#define KML_SYSG(_vector, _addr)			\
++	G(_vector, _addr, KML_STACK, GATE_INTERRUPT, DPL3, __KERNEL_CS)
++
+ #ifdef CONFIG_X86_64
+ /*
+  * Interrupt gate with interrupt stack. The _ist index is the index in
+@@ -82,20 +95,22 @@ static const __initconst struct idt_data early_idts[] = {
+  * set up TSS.
+  */
+ static const __initconst struct idt_data def_idts[] = {
+-	INTG(X86_TRAP_DE,		asm_exc_divide_error),
++	KML_INTG(X86_TRAP_DE,		asm_exc_divide_error),
+ 	ISTG(X86_TRAP_NMI,		asm_exc_nmi, IST_INDEX_NMI),
+-	INTG(X86_TRAP_BR,		asm_exc_bounds),
+-	INTG(X86_TRAP_UD,		asm_exc_invalid_op),
+-	INTG(X86_TRAP_NM,		asm_exc_device_not_available),
+-	INTG(X86_TRAP_OLD_MF,		asm_exc_coproc_segment_overrun),
+-	INTG(X86_TRAP_TS,		asm_exc_invalid_tss),
+-	INTG(X86_TRAP_NP,		asm_exc_segment_not_present),
+-	INTG(X86_TRAP_SS,		asm_exc_stack_segment),
+-	INTG(X86_TRAP_GP,		asm_exc_general_protection),
+-	INTG(X86_TRAP_SPURIOUS,		asm_exc_spurious_interrupt_bug),
+-	INTG(X86_TRAP_MF,		asm_exc_coprocessor_error),
+-	INTG(X86_TRAP_AC,		asm_exc_alignment_check),
+-	INTG(X86_TRAP_XF,		asm_exc_simd_coprocessor_error),
++	KML_SYSG(X86_TRAP_BP,		asm_exc_int3),
++	KML_INTG(X86_TRAP_BR,		asm_exc_bounds),
++	KML_INTG(X86_TRAP_UD,		asm_exc_invalid_op),
++	KML_INTG(X86_TRAP_NM,		asm_exc_device_not_available),
++	KML_INTG(X86_TRAP_OLD_MF,	asm_exc_coproc_segment_overrun),
++	KML_INTG(X86_TRAP_TS,		asm_exc_invalid_tss),
++	KML_INTG(X86_TRAP_NP,		asm_exc_segment_not_present),
++	KML_INTG(X86_TRAP_SS,		asm_exc_stack_segment),
++	KML_INTG(X86_TRAP_GP,		asm_exc_general_protection),
++	KML_INTG(X86_TRAP_PF,		asm_exc_page_fault),
++	KML_INTG(X86_TRAP_SPURIOUS,	asm_exc_spurious_interrupt_bug),
++	KML_INTG(X86_TRAP_MF,		asm_exc_coprocessor_error),
++	KML_INTG(X86_TRAP_AC,		asm_exc_alignment_check),
++	KML_INTG(X86_TRAP_XF,		asm_exc_simd_coprocessor_error),
+ 
+ #ifdef CONFIG_X86_32
+ 	TSKG(X86_TRAP_DF,		GDT_ENTRY_DOUBLEFAULT_TSS),
+@@ -109,19 +124,19 @@ static const __initconst struct idt_data def_idts[] = {
+ #endif
+ 
+ #ifdef CONFIG_X86_CET
+-	INTG(X86_TRAP_CP,		asm_exc_control_protection),
++	KML_INTG(X86_TRAP_CP,		asm_exc_control_protection),
+ #endif
+ 
+ #ifdef CONFIG_AMD_MEM_ENCRYPT
+ 	ISTG(X86_TRAP_VC,		asm_exc_vmm_communication, IST_INDEX_VC),
+ #endif
+ 
+-	SYSG(X86_TRAP_OF,		asm_exc_overflow),
++	KML_SYSG(X86_TRAP_OF,		asm_exc_overflow),
+ };
+ 
+ static const struct idt_data ia32_idt[] __initconst = {
+ #if defined(CONFIG_IA32_EMULATION)
+-	SYSG(IA32_SYSCALL_VECTOR,	asm_int80_emulation),
++	KML_SYSG(IA32_SYSCALL_VECTOR,	asm_int80_emulation),
+ #elif defined(CONFIG_X86_32)
+ 	SYSG(IA32_SYSCALL_VECTOR,	entry_INT80_32),
+ #endif
+@@ -132,42 +147,42 @@ static const struct idt_data ia32_idt[] __initconst = {
+  */
+ static const __initconst struct idt_data apic_idts[] = {
+ #ifdef CONFIG_SMP
+-	INTG(RESCHEDULE_VECTOR,			asm_sysvec_reschedule_ipi),
+-	INTG(CALL_FUNCTION_VECTOR,		asm_sysvec_call_function),
+-	INTG(CALL_FUNCTION_SINGLE_VECTOR,	asm_sysvec_call_function_single),
+-	INTG(REBOOT_VECTOR,			asm_sysvec_reboot),
++	KML_INTG(RESCHEDULE_VECTOR,		asm_sysvec_reschedule_ipi),
++	KML_INTG(CALL_FUNCTION_VECTOR,		asm_sysvec_call_function),
++	KML_INTG(CALL_FUNCTION_SINGLE_VECTOR,	asm_sysvec_call_function_single),
++	KML_INTG(REBOOT_VECTOR,			asm_sysvec_reboot),
+ #endif
+ 
+ #ifdef CONFIG_X86_THERMAL_VECTOR
+-	INTG(THERMAL_APIC_VECTOR,		asm_sysvec_thermal),
++	KML_INTG(THERMAL_APIC_VECTOR,		asm_sysvec_thermal),
+ #endif
+ 
+ #ifdef CONFIG_X86_MCE_THRESHOLD
+-	INTG(THRESHOLD_APIC_VECTOR,		asm_sysvec_threshold),
++	KML_INTG(THRESHOLD_APIC_VECTOR,		asm_sysvec_threshold),
+ #endif
+ 
+ #ifdef CONFIG_X86_MCE_AMD
+-	INTG(DEFERRED_ERROR_VECTOR,		asm_sysvec_deferred_error),
++	KML_INTG(DEFERRED_ERROR_VECTOR,		asm_sysvec_deferred_error),
+ #endif
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+-	INTG(LOCAL_TIMER_VECTOR,		asm_sysvec_apic_timer_interrupt),
+-	INTG(X86_PLATFORM_IPI_VECTOR,		asm_sysvec_x86_platform_ipi),
++	KML_INTG(LOCAL_TIMER_VECTOR,		asm_sysvec_apic_timer_interrupt),
++	KML_INTG(X86_PLATFORM_IPI_VECTOR,	asm_sysvec_x86_platform_ipi),
+ # if IS_ENABLED(CONFIG_KVM)
+-	INTG(POSTED_INTR_VECTOR,		asm_sysvec_kvm_posted_intr_ipi),
+-	INTG(POSTED_INTR_WAKEUP_VECTOR,		asm_sysvec_kvm_posted_intr_wakeup_ipi),
+-	INTG(POSTED_INTR_NESTED_VECTOR,		asm_sysvec_kvm_posted_intr_nested_ipi),
++	KML_INTG(POSTED_INTR_VECTOR,		asm_sysvec_kvm_posted_intr_ipi),
++	KML_INTG(POSTED_INTR_WAKEUP_VECTOR,	asm_sysvec_kvm_posted_intr_wakeup_ipi),
++	KML_INTG(POSTED_INTR_NESTED_VECTOR,	asm_sysvec_kvm_posted_intr_nested_ipi),
+ # endif
+ #ifdef CONFIG_GUEST_PERF_EVENTS
+-	INTG(PERF_GUEST_MEDIATED_PMI_VECTOR,	asm_sysvec_perf_guest_mediated_pmi_handler),
++	KML_INTG(PERF_GUEST_MEDIATED_PMI_VECTOR,	asm_sysvec_perf_guest_mediated_pmi_handler),
+ #endif
+ # ifdef CONFIG_IRQ_WORK
+-	INTG(IRQ_WORK_VECTOR,			asm_sysvec_irq_work),
++	KML_INTG(IRQ_WORK_VECTOR,		asm_sysvec_irq_work),
+ # endif
+-	INTG(SPURIOUS_APIC_VECTOR,		asm_sysvec_spurious_apic_interrupt),
+-	INTG(ERROR_APIC_VECTOR,			asm_sysvec_error_interrupt),
++	KML_INTG(SPURIOUS_APIC_VECTOR,		asm_sysvec_spurious_apic_interrupt),
++	KML_INTG(ERROR_APIC_VECTOR,		asm_sysvec_error_interrupt),
+ # ifdef CONFIG_X86_POSTED_MSI
+-	INTG(POSTED_MSI_NOTIFICATION_VECTOR,	asm_sysvec_posted_msi_notification),
++	KML_INTG(POSTED_MSI_NOTIFICATION_VECTOR,	asm_sysvec_posted_msi_notification),
+ # endif
+ #endif
+ };
+@@ -215,6 +230,16 @@ static __init void set_intr_gate(unsigned int n, const void *addr)
+ 	idt_setup_from_table(idt_table, &data, 1, false);
+ }
+ 
++static __init void set_kml_intr_gate(unsigned int n, const void *addr)
++{
++	struct idt_data data;
++
++	init_idt_data(&data, n, addr);
++	data.bits.ist = KML_STACK;
++
++	idt_setup_from_table(idt_table, &data, 1, false);
++}
++
+ /**
+  * idt_setup_early_traps - Initialize the idt table with early traps
+  *
+@@ -300,7 +325,7 @@ void __init idt_setup_apic_and_irq_gates(void)
+ 
+ 	for_each_clear_bit_from(i, system_vectors, FIRST_SYSTEM_VECTOR) {
+ 		entry = irq_entries_start + IDT_ALIGN * (i - FIRST_EXTERNAL_VECTOR);
+-		set_intr_gate(i, entry);
++		set_kml_intr_gate(i, entry);
+ 	}
+ 
+ #ifdef CONFIG_X86_LOCAL_APIC
+@@ -311,7 +336,7 @@ void __init idt_setup_apic_and_irq_gates(void)
+ 		 * /proc/interrupts.
+ 		 */
+ 		entry = spurious_entries_start + IDT_ALIGN * (i - FIRST_SYSTEM_VECTOR);
+-		set_intr_gate(i, entry);
++		set_kml_intr_gate(i, entry);
+ 	}
+ #endif
+ 	/* Map IDT into CPU entry area and reload it. */
+@@ -359,5 +384,5 @@ void __init idt_install_sysvec(unsigned int n, const void *function)
+ 		return;
+ 
+ 	if (!WARN_ON(test_and_set_bit(n, system_vectors)))
+-		set_intr_gate(n, function);
++		set_kml_intr_gate(n, function);
+ }
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 2bce7b3f9..427c35780 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -581,14 +581,31 @@ start_thread_common(struct pt_regs *regs, unsigned long new_ip,
+ void
+ start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
+ {
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	clear_thread_flag(TIF_KU);
++#endif
+ 	start_thread_common(regs, new_ip, new_sp,
+ 			    __USER_CS, __USER_DS, 0);
+ }
+ EXPORT_SYMBOL_GPL(start_thread);
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++void
++start_kernel_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
++{
++	set_thread_flag(TIF_KU);
++	start_thread_common(regs, new_ip, new_sp,
++			    __KML_CS, __KERNEL_DS, 0);
++}
++EXPORT_SYMBOL_GPL(start_kernel_thread);
++#endif
++
+ #ifdef CONFIG_COMPAT
+ void compat_start_thread(struct pt_regs *regs, u32 new_ip, u32 new_sp, bool x32)
+ {
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	clear_thread_flag(TIF_KU);
++#endif
+ 	start_thread_common(regs, new_ip, new_sp,
+ 			    x32 ? __USER_CS : __USER32_CS,
+ 			    __USER_DS, __USER_DS);
+diff --git a/arch/x86/kernel/signal_64.c b/arch/x86/kernel/signal_64.c
+index d483b585c..b9f74d8e1 100644
+--- a/arch/x86/kernel/signal_64.c
++++ b/arch/x86/kernel/signal_64.c
+@@ -77,9 +77,17 @@ static bool restore_sigcontext(struct pt_regs *regs,
+ 	regs->r14 = sc.r14;
+ 	regs->r15 = sc.r15;
+ 
+-	/* Get CS/SS and force CPL3 */
+-	regs->cs = sc.cs | 0x03;
+-	regs->ss = sc.ss | 0x03;
++	/* Get CS/SS and force CPL3 (unless KML Ring-0 user task) */
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (unlikely(test_thread_flag(TIF_KU))) {
++		regs->cs = __KML_CS;
++		regs->ss = __KERNEL_DS;
++	} else
++#endif
++	{
++		regs->cs = sc.cs | 0x03;
++		regs->ss = sc.ss | 0x03;
++	}
+ 
+ 	regs->flags = (regs->flags & ~FIX_EFLAGS) | (sc.flags & FIX_EFLAGS);
+ 	/* disable syscall checks */
+@@ -89,7 +97,12 @@ static bool restore_sigcontext(struct pt_regs *regs,
+ 	 * Fix up SS if needed for the benefit of old DOSEMU and
+ 	 * CRIU.
+ 	 */
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (!test_thread_flag(TIF_KU) &&
++	    unlikely(!(uc_flags & UC_STRICT_RESTORE_SS) && user_64bit_mode(regs)))
++#else
+ 	if (unlikely(!(uc_flags & UC_STRICT_RESTORE_SS) && user_64bit_mode(regs)))
++#endif
+ 		force_valid_ss(regs);
+ 
+ 	return fpu__restore_sig((void __user *)sc.fpstate, 0);
+@@ -228,10 +241,18 @@ int x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
+ 	 * a trampoline.)  So we do our best: if the old SS was valid,
+ 	 * we keep it.  Otherwise we replace it.
+ 	 */
+-	regs->cs = __USER_CS;
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (unlikely(test_thread_flag(TIF_KU))) {
++		regs->cs = __KML_CS;
++		regs->ss = __KERNEL_DS;
++	} else
++#endif
++	{
++		regs->cs = __USER_CS;
+ 
+-	if (unlikely(regs->ss != __USER_DS))
+-		force_valid_ss(regs);
++		if (unlikely(regs->ss != __USER_DS))
++			force_valid_ss(regs);
++	}
+ 
+ 	return 0;
+ 
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index 30aa83699..7e38147d2 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -1049,6 +1049,30 @@ asmlinkage __visible noinstr struct pt_regs *sync_regs(struct pt_regs *eregs)
+ 	return regs;
  }
  
 +#ifdef CONFIG_KERNEL_MODE_LINUX
++asmlinkage __visible noinstr struct pt_regs *kml_switch_off_ist(struct pt_regs *eregs)
++{
++	struct cea_exception_stacks *cea = __this_cpu_read(cea_exception_stacks);
++	unsigned long top, bot, frame_size;
++	void *dst;
++
++	if (!cea)
++		return eregs;
++
++	top = CEA_ESTACK_TOP(cea, KML);
++	bot = CEA_ESTACK_BOT(cea, KML);
++	if ((unsigned long)eregs < bot || (unsigned long)eregs >= top)
++		return eregs;
++	if (eregs->sp >= bot && eregs->sp <= top)
++		return eregs;
++
++	frame_size = top - (unsigned long)eregs;
++	dst = (void *)(eregs->sp - frame_size);
++	__memcpy(dst, eregs, frame_size);
++	return (struct pt_regs *)dst;
++}
++#endif
++
+ #ifdef CONFIG_AMD_MEM_ENCRYPT
+ asmlinkage __visible noinstr struct pt_regs *vc_switch_off_ist(struct pt_regs *regs)
+ {
+diff --git a/arch/x86/mm/cpu_entry_area.c b/arch/x86/mm/cpu_entry_area.c
+index 575f863f3..4ecfec772 100644
+--- a/arch/x86/mm/cpu_entry_area.c
++++ b/arch/x86/mm/cpu_entry_area.c
+@@ -162,6 +162,9 @@ static void __init percpu_setup_exception_stacks(unsigned int cpu)
+ 			cea_map_stack(VC2);
+ 		}
+ 	}
++
++	if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX))
++		cea_map_stack(KML);
+ }
+ #else
+ static void __init percpu_setup_exception_stacks(unsigned int cpu)
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index aa88370ce..bdd94ac88 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1226,7 +1226,8 @@ void do_user_addr_fault(struct pt_regs *regs,
+ 	tsk = current;
+ 	mm = tsk->mm;
+ 
+-	if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR)) {
++	if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR) &&
++	    !user_mode(regs)) {
+ 		/*
+ 		 * Whoops, this is kernel mode code trying to execute from
+ 		 * user memory.  Unless this is AMD erratum #93, which
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index 06d0df105..9eeb120dc 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -826,8 +826,47 @@ static int parse_elf_properties(struct file *f, const struct elf_phdr *phdr,
+ 	return ret == -ENOENT ? 0 : ret;
+ }
+ 
++#if defined(CONFIG_KERNEL_MODE_LINUX) && !ELF_COMPAT
 +#include <linux/fs_struct.h>
++
 +/*
-+ * XXX : we haven't implemented safety check of user programs.
++ * XXX: Binary safety verification (e.g., TAL) is not yet enforced;
++ * executables under /trusted/ on the real root filesystem run in kernel mode.
 + */
 +#define TRUSTED_DIR_STR		"/trusted/"
 +#define TRUSTED_DIR_STR_LEN	9
 +
-+static inline int is_safe(struct file* file)
++static inline bool is_kml_trusted(struct file *file)
 +{
-+	int ret;
-+	char* path;
-+	char* tmp;
++	bool ret = false;
++	char *path;
++	char *tmp;
 +
 +#ifdef CONFIG_KML_CHECK_CHROOT
-+	if (current_chrooted()) {
-+		return 0;
-+	}
++	if (current_chrooted())
++		return false;
 +#endif
++	if (!file)
++		return false;
 +
-+	tmp = (char*)__get_free_page(GFP_KERNEL);
-+
-+	if (!tmp) {
-+		return 0;
-+	}
++	tmp = (char *)__get_free_page(GFP_KERNEL);
++	if (!tmp)
++		return false;
 +
 +	path = d_path(&file->f_path, tmp, PAGE_SIZE);
-+	ret = (0 == strncmp(TRUSTED_DIR_STR, path, TRUSTED_DIR_STR_LEN));
++	if (!IS_ERR(path))
++		ret = (strncmp(TRUSTED_DIR_STR, path, TRUSTED_DIR_STR_LEN) == 0);
 +
-+        free_page((unsigned long)tmp);
-+        return ret;
++	free_page((unsigned long)tmp);
++	return ret;
 +}
 +#endif
 +
  static int load_elf_binary(struct linux_binprm *bprm)
  {
-+#ifdef CONFIG_KERNEL_MODE_LINUX
-+	int kernel_mode = 0;
++#if defined(CONFIG_KERNEL_MODE_LINUX) && !ELF_COMPAT
++	bool kernel_mode = false;
 +#endif
  	struct file *interpreter = NULL; /* to shut gcc up */
-  	unsigned long load_addr = 0, load_bias = 0;
- 	int load_addr_set = 0;
-@@ -1040,8 +1085,15 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	unsigned long load_bias = 0, phdr_addr = 0;
+ 	int first_pt_load = 1;
+@@ -1293,6 +1332,9 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 		goto out;
  #endif /* ARCH_HAS_SETUP_ADDITIONAL_PAGES */
  
- 	install_exec_creds(bprm);
-+#ifdef CONFIG_KERNEL_MODE_LINUX
-+	kernel_mode = is_safe(bprm->file);
++#if defined(CONFIG_KERNEL_MODE_LINUX) && !ELF_COMPAT
++	kernel_mode = is_kml_trusted(bprm->file);
 +#endif
- 	retval = create_elf_tables(bprm, &loc->elf_ex,
--			  load_addr, interp_load_addr);
-+			  load_addr, interp_load_addr
-+#ifdef CONFIG_KERNEL_MODE_LINUX
-+			  , kernel_mode
-+#endif
-+			  );
+ 	retval = create_elf_tables(bprm, elf_ex, interp_load_addr,
+ 				   e_entry, phdr_addr);
  	if (retval < 0)
- 		goto out;
- 	/* N.B. passed_fileno might not be initialized? */
-@@ -1082,7 +1134,15 @@ static int load_elf_binary(struct linux_binprm *bprm)
- 	ELF_PLAT_INIT(regs, reloc_func_desc);
+@@ -1373,7 +1415,14 @@ static int load_elf_binary(struct linux_binprm *bprm)
  #endif
  
-+#ifndef CONFIG_KERNEL_MODE_LINUX
- 	start_thread(regs, elf_entry, bprm->p);
-+#else
-+	if (kernel_mode) {
+ 	finalize_exec(bprm);
++#if defined(CONFIG_KERNEL_MODE_LINUX) && !ELF_COMPAT
++	if (kernel_mode)
 +		start_kernel_thread(regs, elf_entry, bprm->p);
-+	} else {
-+		start_thread(regs, elf_entry, bprm->p);
-+	}
++	else
++		START_THREAD(elf_ex, regs, elf_entry, bprm->p);
++#else
+ 	START_THREAD(elf_ex, regs, elf_entry, bprm->p);
 +#endif
  	retval = 0;
  out:
- 	kfree(loc);
-diff --git a/fs/compat_binfmt_elf.c b/fs/compat_binfmt_elf.c
-index 4d24d17..a57204a 100644
---- a/fs/compat_binfmt_elf.c
-+++ b/fs/compat_binfmt_elf.c
-@@ -142,4 +142,7 @@ static void cputime_to_compat_timeval(const cputime_t cputime,
- /*
-  * We share all the actual code with the native (64-bit) version.
-  */
+ 	return retval;
+diff --git a/include/asm-generic/access_ok.h b/include/asm-generic/access_ok.h
+index 2866ae61b..7ffb5eaba 100644
+--- a/include/asm-generic/access_ok.h
++++ b/include/asm-generic/access_ok.h
+@@ -36,6 +36,10 @@ static inline int __access_ok(const void __user *ptr, unsigned long size)
+ 	if (IS_ENABLED(CONFIG_ALTERNATE_USER_ADDRESS_SPACE) ||
+ 	    !IS_ENABLED(CONFIG_MMU))
+ 		return true;
 +#ifdef CONFIG_KERNEL_MODE_LINUX
-+#define INCLUDED_FOR_COMPAT
++	if (unlikely(test_thread_flag(TIF_KU)))
++		return true;
 +#endif
- #include "binfmt_elf.c"
-diff --git a/init/do_mounts.c b/init/do_mounts.c
-index dea5de9..fe948d3 100644
---- a/init/do_mounts.c
-+++ b/init/do_mounts.c
-@@ -44,6 +44,10 @@ static int root_wait;
  
- dev_t ROOT_DEV;
- 
-+#ifdef CONFIG_KERNEL_MODE_LINUX
-+struct path* boot_root;
-+#endif
-+
- static int __init load_ramdisk(char *str)
- {
- 	rd_doload = simple_strtol(str,NULL,0) & 3;
-@@ -602,6 +606,10 @@ out:
- 	devtmpfs_mount("dev");
- 	sys_mount(".", "/", NULL, MS_MOVE, NULL);
- 	sys_chroot(".");
-+#ifdef CONFIG_KERNEL_MODE_LINUX
-+	boot_root = &current->fs->root;
-+	path_get(boot_root);
-+#endif
+ 	return (size <= limit) && (addr <= (limit - size));
  }
- 
- static bool is_tmpfs;
+diff --git a/include/linux/kml.h b/include/linux/kml.h
+new file mode 100644
+index 000000000..80a714119
+--- /dev/null
++++ b/include/linux/kml.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_KML_H
++#define _LINUX_KML_H
++
++#include <linux/types.h>
++
++void trace_call_by_kml(void);
++
++#endif /* _LINUX_KML_H */
 diff --git a/kernel/Kconfig.kml b/kernel/Kconfig.kml
 new file mode 100644
-index 0000000..9925a1d
+index 000000000..dcd3b54af
 --- /dev/null
 +++ b/kernel/Kconfig.kml
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,40 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++config ARCH_SUPPORTS_KML
++	bool
 +
 +menu "Kernel Mode Linux"
++	depends on ARCH_SUPPORTS_KML
 +
 +config KERNEL_MODE_LINUX
-+        bool "Kernel Mode Linux"
-+        ---help---
-+          This enables Kernel Mode Linux. In Kernel Mode Linux, user programs
-+          can be executed safely in kernel mode and access a kernel address space
-+          directly. Thus, for example, costly mode switching between a user and a kernel
-+          can be eliminated. If you say Y here, the kernel enables Kernel Mode Linux.
++	bool "Kernel Mode Linux"
++	help
++	  This enables Kernel Mode Linux. In Kernel Mode Linux, trusted user
++	  programs can be executed in kernel mode (CPU Ring 0 on x86_64, or
++	  SYSTEM_MODE on ARM) and access kernel address space directly. Thus,
++	  costly privilege-level switches between user mode and kernel mode can
++	  be eliminated for real-time or latency-critical workloads.
 +
-+          More information about Kernel Mode Linux can be found in the
-+          <file:Documentation/kml.txt>
++	  More information about Kernel Mode Linux can be found in
++	  <file:Documentation/admin-guide/kml.rst>.
 +
-+          If you don't know what to do here, say N.
++	  If you don't know what to do here, say N.
 +
 +config KML_CHECK_CHROOT
-+        bool "Check for chroot"
-+        default y
-+        depends on KERNEL_MODE_LINUX
-+        ---help---
-+          This enables the check for the current root file system being chrooted
-+          when executing user processes in kernel mode. In the current KML
-+          implementation, programs in the dicretory "/trusted" are executed in
-+          kernel mode. Therefore, the chroot check is necessary because,
-+          if the root file system is chrooted to "/home/foo/",
-+          programs in the directory "/home/foo/trusted" are accidentally executed in kernel mode.
++	bool "Check for chroot"
++	default y
++	depends on KERNEL_MODE_LINUX
++	help
++	  This enables checking whether the current root file system is chrooted
++	  before executing user processes in kernel mode. In the current KML
++	  implementation, programs in the directory "/trusted" are executed in
++	  kernel mode. Therefore, the chroot check ensures that if the root file
++	  system is chrooted to "/home/foo/", programs in "/home/foo/trusted"
++	  are not accidentally executed in kernel mode.
 +
-+          If you don't know what to do here, say Y.
++	  If you don't know what to do here, say Y.
 +
-+comment "Safety check have not been implemented"
-+depends on KERNEL_MODE_LINUX
++comment "Safety check has not been implemented"
++	depends on KERNEL_MODE_LINUX
 +
 +endmenu
 diff --git a/kernel/tracepoint.c b/kernel/tracepoint.c
-index ecd536d..69739c0 100644
+index dffef52a8..231baab6e 100644
 --- a/kernel/tracepoint.c
 +++ b/kernel/tracepoint.c
-@@ -524,6 +524,11 @@ void for_each_kernel_tracepoint(void (*fct)(struct tracepoint *tp, void *priv),
+@@ -14,6 +14,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/sched/task.h>
+ #include <linux/static_key.h>
++#include <linux/kml.h>
+ 
+ enum tp_func_state {
+ 	TP_FUNC_0,
+@@ -756,6 +757,14 @@ void for_each_kernel_tracepoint(void (*fct)(struct tracepoint *tp, void *priv),
  }
  EXPORT_SYMBOL_GPL(for_each_kernel_tracepoint);
  
++#ifdef CONFIG_KERNEL_MODE_LINUX
 +void trace_call_by_kml(void)
 +{
 +	trace_printk("called\n");
 +}
 +EXPORT_SYMBOL_GPL(trace_call_by_kml);
++#endif
++
  #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
  
  /* NB: reg/unreg are called while guarded with the tracepoints_mutex */
-diff --git a/lib/iov_iter.c b/lib/iov_iter.c
-index 75232ad..a609631 100644
---- a/lib/iov_iter.c
-+++ b/lib/iov_iter.c
-@@ -348,7 +348,11 @@ void iov_iter_init(struct iov_iter *i, int direction,
- 			size_t count)
- {
- 	/* It will get better.  Eventually... */
-+#ifndef CONFIG_KERNEL_MODE_LINUX
- 	if (segment_eq(get_fs(), KERNEL_DS)) {
-+#else
-+	if (segment_eq(get_fs(), KERNEL_DS) && !test_thread_flag(TIF_KU)) {
-+#endif
- 		direction |= ITER_KVEC;
- 		i->type = direction;
- 		i->kvec = (struct kvec *)iov;
-diff --git a/mm/memory.c b/mm/memory.c
-index 76dcee3..6025793 100644
---- a/mm/memory.c
-+++ b/mm/memory.c
-@@ -3837,7 +3837,11 @@ void __might_fault(const char *file, int line)
- 	 * get paged out, therefore we'll never actually fault, and the
- 	 * below annotations will generate false positives.
- 	 */
-+#ifndef CONFIG_KERNEL_MODE_LINUX
- 	if (segment_eq(get_fs(), KERNEL_DS))
-+#else
-+	if (segment_eq(get_fs(), KERNEL_DS) && !test_thread_flag(TIF_KU))
-+#endif
- 		return;
- 	if (pagefault_disabled())
- 		return;
-diff --git a/security/tomoyo/network.c b/security/tomoyo/network.c
-index 9752771..94aed5c 100644
---- a/security/tomoyo/network.c
-+++ b/security/tomoyo/network.c
-@@ -608,7 +608,11 @@ static int tomoyo_check_unix_address(struct sockaddr *addr,
- static bool tomoyo_kernel_service(void)
- {
- 	/* Nothing to do if I am a kernel service. */
-+#ifndef CONFIG_KERNEL_MODE_LINUX
- 	return segment_eq(get_fs(), KERNEL_DS);
-+#else
-+	return segment_eq(get_fs(), KERNEL_DS) && !test_thread_flag(TIF_KU);
-+#endif
- }
- 
- /**
 -- 
-2.1.4
+2.56.1.708.g77570a6a1d-goog
 
