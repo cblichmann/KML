@@ -1,4 +1,5 @@
 /qemu-test/out/
 /build-x86_64/
+/build-aarch64/
 *.o
 *.so

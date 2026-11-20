@@ -1,9 +1,9 @@
-From 8261be2568554897b23524ffbdf9810b569267b3 Mon Sep 17 00:00:00 2001
+From e6021387c81328ddb312651237c88123cef961e7 Mon Sep 17 00:00:00 2001
 From: Christian Blichmann <cblichmann@google.com>
 Date: Thu, 19 Nov 2026 12:22:05 +0100
 Subject: [PATCH 1/2] Integrate KML
 
-Port Kernel Mode Linux (KML) to Linux 7.3 for both x86_64 and ARM:
+Port Kernel Mode Linux (KML) to Linux 7.3 for x86_64, AArch64, and ARM:
 
 - Add CONFIG_KERNEL_MODE_LINUX and CONFIG_KML_CHECK_CHROOT Kconfig options
   and Sphinx documentation under Documentation/admin-guide/kml.rst.
@@ -14,12 +14,18 @@ Port Kernel Mode Linux (KML) to Linux 7.3 for both x86_64 and ARM:
 - Implement x86_64 Ring-0 user execution using a dedicated __KML_CS GDT
   descriptor, per-CPU IST_INDEX_KML interrupt/exception stack switching,
   signal/syscall CS/SS preservation, and SMEP/SMAP disablement.
+- Implement 64-bit ARM (AArch64) EL1t (SPSel=0, PSR_MODE_EL1t) execution,
+  routing EL1t vectors through kernel_entry 0, 64 / ret_to_user, clearing
+  PTE_PXN and user-table *_TABLE_PXN bits for executable user VMAs,
+  recording EL1t status in TPIDRRO_EL0, disabling PAN/S1PIE/kernel-PAC
+  conflicts, and preserving EL1t PSTATE across fork/clone, ptrace, and
+  signal delivery.
 - Port 32-bit ARM SYSTEM_MODE execution, exception vector dispatch, and
   TIF_KU handling to Linux 7.3.
 ---
  CREDITS                               |  4 ++
  Documentation/admin-guide/index.rst   |  1 +
- Documentation/admin-guide/kml.rst     | 59 ++++++++++++++++
+ Documentation/admin-guide/kml.rst     | 69 +++++++++++++++++++
  Kconfig                               |  2 +
  MAINTAINERS                           |  8 +++
  Makefile                              |  2 +-
@@ -30,6 +36,22 @@ Port Kernel Mode Linux (KML) to Linux 7.3 for both x86_64 and ARM:
  arch/arm/include/asm/uaccess.h        | 17 ++++-
  arch/arm/kernel/entry-armv.S          | 18 ++++-
  arch/arm/kernel/process.c             |  8 +++
+ arch/arm64/Kconfig                    |  3 +-
+ arch/arm64/include/asm/pgalloc.h      | 20 ++++--
+ arch/arm64/include/asm/pgtable-prot.h | 12 +++-
+ arch/arm64/include/asm/pointer_auth.h |  2 +
+ arch/arm64/include/asm/processor.h    | 20 ++++++
+ arch/arm64/include/asm/ptrace.h       |  6 ++
+ arch/arm64/include/asm/thread_info.h  |  6 ++
+ arch/arm64/include/asm/uaccess.h      | 59 +++++++++++++---
+ arch/arm64/kernel/cpufeature.c        |  6 ++
+ arch/arm64/kernel/entry-common.c      | 92 +++++++++++++++++++++++++
+ arch/arm64/kernel/entry.S             | 26 +++++++
+ arch/arm64/kernel/process.c           | 11 +++
+ arch/arm64/kernel/ptrace.c            | 17 +++--
+ arch/arm64/kernel/signal.c            |  5 ++
+ arch/arm64/mm/fault.c                 |  9 ++-
+ arch/arm64/mm/proc.S                  |  2 +
  arch/x86/Kconfig                      |  1 +
  arch/x86/entry/entry_64.S             | 63 +++++++++++++++--
  arch/x86/entry/syscall_64.c           |  6 ++
@@ -52,9 +74,9 @@ Port Kernel Mode Linux (KML) to Linux 7.3 for both x86_64 and ARM:
  fs/binfmt_elf.c                       | 49 ++++++++++++++
  include/asm-generic/access_ok.h       |  4 ++
  include/linux/kml.h                   |  9 +++
- kernel/Kconfig.kml                    | 40 +++++++++++
+ kernel/Kconfig.kml                    | 41 +++++++++++
  kernel/tracepoint.c                   |  9 +++
- 37 files changed, 542 insertions(+), 57 deletions(-)
+ 53 files changed, 826 insertions(+), 80 deletions(-)
  create mode 100644 Documentation/admin-guide/kml.rst
  create mode 100644 include/linux/kml.h
  create mode 100644 kernel/Kconfig.kml
@@ -88,10 +110,10 @@ index cd28dfe91..94701ab7f 100644
  documents are ... old ...
 diff --git a/Documentation/admin-guide/kml.rst b/Documentation/admin-guide/kml.rst
 new file mode 100644
-index 000000000..3f0e3fcb7
+index 000000000..c3a462f35
 --- /dev/null
 +++ b/Documentation/admin-guide/kml.rst
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,69 @@
 +.. SPDX-License-Identifier: GPL-2.0
 +
 +=================
@@ -116,6 +138,8 @@ index 000000000..3f0e3fcb7
 +
 +- ``x86_64`` (Ring 0 via dedicated ``__KML_CS`` 64-bit code segment and IST
 +  exception/interrupt stack switching, with ``PREEMPT_RT`` support)
++- ``arm64`` (AArch64 ``EL1t`` / ``PSR_MODE_EL1t`` with ``SPSel = 0``, user
++  executable page-table ``PXN`` cleared, and ``PREEMPT_RT`` support)
 +- ``arm`` (32-bit ARM ``SYSTEM_MODE`` when CPU domains and PAN are disabled)
 +
 +Usage
@@ -124,7 +148,9 @@ index 000000000..3f0e3fcb7
 +1. Enable ``CONFIG_KERNEL_MODE_LINUX=y`` (and optionally
 +   ``CONFIG_KML_CHECK_CHROOT=y``) in the kernel configuration.
 +   On ``x86_64``, ensure ``CONFIG_MITIGATION_PAGE_TABLE_ISOLATION=n`` and
-+   ``CONFIG_X86_FRED=n``. On ``arm``, ensure ``CONFIG_ARM_PAN=n``.
++   ``CONFIG_X86_FRED=n``. On ``arm64``, ensure ``CONFIG_UNMAP_KERNEL_AT_EL0=n``,
++   ``CONFIG_ARM64_PAN=n``, ``CONFIG_ARM64_SW_TTBR0_PAN=n``, and
++   ``CONFIG_ARM64_PIE=n``. On ``arm``, ensure ``CONFIG_ARM_PAN=n``.
 +2. Build and boot the kernel.
 +3. Place trusted ELF executables in the ``/trusted/`` directory on the root
 +   filesystem and invoke them via ``/trusted/<program>``:
@@ -148,6 +174,12 @@ index 000000000..3f0e3fcb7
 +  exceptions use a dedicated IST stack (``IST_INDEX_KML``) so user stacks are
 +  never written by the CPU prior to stack switching, and SMEP/SMAP are cleared
 +  at boot when KML is enabled.
++- **arm64**: ``start_kernel_thread()`` initializes ``PSTATE`` to
++  ``PSR_MODE_EL1t`` (``SPSel = 0``, so user execution uses ``SP_EL0`` while
++  exceptions automatically switch to the task kernel stack in ``SP_EL1``), sets
++  ``TIF_KU`` and ``TPIDRRO_EL0 = 1``, clears ``PTE_PXN`` and hierarchical
++  user-table ``PXNTable`` bits on executable user mappings, and routes ``EL1t``
++  vectors through ``kernel_entry 0, 64`` / ``ret_to_user``.
 +- **ARM**: ``start_kernel_thread()`` initializes ``CPSR`` to ``SYSTEM_MODE``
 +  (``0x1f``) and sets ``TIF_KU``, while the exception vector stubs route mode
 +  ``0xf`` entries to the user-mode handlers.
@@ -438,6 +470,685 @@ index d7aa95225..f74df45a2 100644
  static const char *processor_modes[] __maybe_unused = {
    "USER_26", "FIQ_26" , "IRQ_26" , "SVC_26" , "UK4_26" , "UK5_26" , "UK6_26" , "UK7_26" ,
    "UK8_26" , "UK9_26" , "UK10_26", "UK11_26", "UK12_26", "UK13_26", "UK14_26", "UK15_26",
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index cab741a69..31f2379fe 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -71,6 +71,7 @@ config ARM64
+ 	select ARCH_USE_SYM_ANNOTATIONS
+ 	select ARCH_SUPPORTS_DEBUG_PAGEALLOC
+ 	select ARCH_SUPPORTS_HUGETLBFS
++	select ARCH_SUPPORTS_KML if !UNMAP_KERNEL_AT_EL0 && !ARM64_SW_TTBR0_PAN && !ARM64_PAN && !ARM64_PIE
+ 	select ARCH_SUPPORTS_MEMORY_FAILURE
+ 	select ARCH_SUPPORTS_SHADOW_CALL_STACK if CC_HAVE_SHADOW_CALL_STACK
+ 	select ARCH_SUPPORTS_LTO_CLANG if CPU_LITTLE_ENDIAN
+@@ -2075,7 +2076,7 @@ config ARM64_PTR_AUTH
+ config ARM64_PTR_AUTH_KERNEL
+ 	bool "Use pointer authentication for kernel"
+ 	default y
+-	depends on ARM64_PTR_AUTH
++	depends on ARM64_PTR_AUTH && !KERNEL_MODE_LINUX
+ 	# Modern compilers insert a .note.gnu.property section note for PAC
+ 	# which is only understood by binutils starting with version 2.33.1.
+ 	depends on LD_IS_LLD || LD_VERSION >= 23301 || (CC_IS_GCC && GCC_VERSION < 90100)
+diff --git a/arch/arm64/include/asm/pgalloc.h b/arch/arm64/include/asm/pgalloc.h
+index 1b4509d33..5383acd65 100644
+--- a/arch/arm64/include/asm/pgalloc.h
++++ b/arch/arm64/include/asm/pgalloc.h
+@@ -19,6 +19,18 @@
+ 
+ #define PGD_SIZE	(PTRS_PER_PGD * sizeof(pgd_t))
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define KML_PUD_USER_TABLE_PXN	(_AT(pudval_t, 0))
++#define KML_P4D_USER_TABLE_PXN	(_AT(p4dval_t, 0))
++#define KML_PGD_USER_TABLE_PXN	(_AT(pgdval_t, 0))
++#define KML_PMD_USER_TABLE_PXN	(_AT(pmdval_t, 0))
++#else
++#define KML_PUD_USER_TABLE_PXN	PUD_TABLE_PXN
++#define KML_P4D_USER_TABLE_PXN	P4D_TABLE_PXN
++#define KML_PGD_USER_TABLE_PXN	PGD_TABLE_PXN
++#define KML_PMD_USER_TABLE_PXN	PMD_TABLE_PXN
++#endif
++
+ #if CONFIG_PGTABLE_LEVELS > 2
+ 
+ static inline void __pud_populate(pud_t *pudp, phys_addr_t pmdp, pudval_t prot)
+@@ -30,7 +42,7 @@ static inline void pud_populate(struct mm_struct *mm, pud_t *pudp, pmd_t *pmdp)
+ {
+ 	pudval_t pudval = PUD_TYPE_TABLE | PUD_TABLE_AF;
+ 
+-	pudval |= (mm == &init_mm) ? PUD_TABLE_UXN : PUD_TABLE_PXN;
++	pudval |= (mm == &init_mm) ? PUD_TABLE_UXN : KML_PUD_USER_TABLE_PXN;
+ 	__pud_populate(pudp, __pa(pmdp), pudval);
+ }
+ #else
+@@ -52,7 +64,7 @@ static inline void p4d_populate(struct mm_struct *mm, p4d_t *p4dp, pud_t *pudp)
+ {
+ 	p4dval_t p4dval = P4D_TYPE_TABLE | P4D_TABLE_AF;
+ 
+-	p4dval |= (mm == &init_mm) ? P4D_TABLE_UXN : P4D_TABLE_PXN;
++	p4dval |= (mm == &init_mm) ? P4D_TABLE_UXN : KML_P4D_USER_TABLE_PXN;
+ 	__p4d_populate(p4dp, __pa(pudp), p4dval);
+ }
+ 
+@@ -81,7 +93,7 @@ static inline void pgd_populate(struct mm_struct *mm, pgd_t *pgdp, p4d_t *p4dp)
+ {
+ 	pgdval_t pgdval = PGD_TYPE_TABLE | PGD_TABLE_AF;
+ 
+-	pgdval |= (mm == &init_mm) ? PGD_TABLE_UXN : PGD_TABLE_PXN;
++	pgdval |= (mm == &init_mm) ? PGD_TABLE_UXN : KML_PGD_USER_TABLE_PXN;
+ 	__pgd_populate(pgdp, __pa(p4dp), pgdval);
+ }
+ 
+@@ -118,7 +130,7 @@ pmd_populate(struct mm_struct *mm, pmd_t *pmdp, pgtable_t ptep)
+ {
+ 	VM_BUG_ON(mm == &init_mm);
+ 	__pmd_populate(pmdp, page_to_phys(ptep),
+-		       PMD_TYPE_TABLE | PMD_TABLE_AF | PMD_TABLE_PXN);
++		       PMD_TYPE_TABLE | PMD_TABLE_AF | KML_PMD_USER_TABLE_PXN);
+ }
+ 
+ #endif
+diff --git a/arch/arm64/include/asm/pgtable-prot.h b/arch/arm64/include/asm/pgtable-prot.h
+index 09d7c00cf..8b39499d1 100644
+--- a/arch/arm64/include/asm/pgtable-prot.h
++++ b/arch/arm64/include/asm/pgtable-prot.h
+@@ -58,11 +58,17 @@
+ #define _PAGE_KERNEL_EXEC	((PROT_NORMAL & ~PTE_PXN) | PTE_DIRTY)
+ #define _PAGE_KERNEL_EXEC_CONT	((PROT_NORMAL & ~PTE_PXN) | PTE_CONT | PTE_DIRTY)
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define _PAGE_KML_EXEC_PXN	(_AT(pteval_t, 0))
++#else
++#define _PAGE_KML_EXEC_PXN	PTE_PXN
++#endif
++
+ #define _PAGE_SHARED		(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | PTE_PXN | PTE_UXN | PTE_WRITE)
+-#define _PAGE_SHARED_EXEC	(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | PTE_PXN | PTE_WRITE)
++#define _PAGE_SHARED_EXEC	(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | _PAGE_KML_EXEC_PXN | PTE_WRITE)
+ #define _PAGE_READONLY		(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | PTE_PXN | PTE_UXN)
+-#define _PAGE_READONLY_EXEC	(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | PTE_PXN)
+-#define _PAGE_EXECONLY		(_PAGE_DEFAULT | PTE_RDONLY | PTE_NG | PTE_PXN)
++#define _PAGE_READONLY_EXEC	(_PAGE_DEFAULT | PTE_USER | PTE_RDONLY | PTE_NG | _PAGE_KML_EXEC_PXN)
++#define _PAGE_EXECONLY		(_PAGE_DEFAULT | PTE_RDONLY | PTE_NG | _PAGE_KML_EXEC_PXN)
+ 
+ #ifndef __ASSEMBLER__
+ 
+diff --git a/arch/arm64/include/asm/pointer_auth.h b/arch/arm64/include/asm/pointer_auth.h
+index d2e0306e6..75c7993d4 100644
+--- a/arch/arm64/include/asm/pointer_auth.h
++++ b/arch/arm64/include/asm/pointer_auth.h
+@@ -74,6 +74,8 @@ static __always_inline void ptrauth_keys_switch_kernel(struct ptrauth_keys_kerne
+ static inline void ptrauth_keys_install_user(struct ptrauth_keys_user *keys)
+ {
+ 	if (system_supports_address_auth()) {
++		if (!IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL))
++			__ptrauth_key_install_nosync(APIA, keys->apia);
+ 		__ptrauth_key_install_nosync(APIB, keys->apib);
+ 		__ptrauth_key_install_nosync(APDA, keys->apda);
+ 		__ptrauth_key_install_nosync(APDB, keys->apdb);
+diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+index 6dfbcacd9..12814cf87 100644
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -339,16 +339,36 @@ static inline void start_thread_common(struct pt_regs *regs, unsigned long pc,
+ static inline void start_thread(struct pt_regs *regs, unsigned long pc,
+ 				unsigned long sp)
+ {
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	clear_thread_flag(TIF_KU);
++	write_sysreg(0, tpidrro_el0);
++#endif
+ 	start_thread_common(regs, pc, PSR_MODE_EL0t);
+ 	spectre_v4_enable_task_mitigation(current);
+ 	regs->sp = sp;
+ }
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++static inline void start_kernel_thread(struct pt_regs *regs, unsigned long pc,
++				       unsigned long sp)
++{
++	set_thread_flag(TIF_KU);
++	write_sysreg(1, tpidrro_el0);
++	start_thread_common(regs, pc, PSR_MODE_EL1t);
++	spectre_v4_enable_task_mitigation(current);
++	regs->sp = sp;
++}
++#endif
++
+ #ifdef CONFIG_COMPAT
+ static inline void compat_start_thread(struct pt_regs *regs, unsigned long pc,
+ 				       unsigned long sp)
+ {
+ 	unsigned long pstate = PSR_AA32_MODE_USR;
++
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	clear_thread_flag(TIF_KU);
++#endif
+ 	if (pc & 1)
+ 		pstate |= PSR_AA32_T_BIT;
+ 	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
+diff --git a/arch/arm64/include/asm/ptrace.h b/arch/arm64/include/asm/ptrace.h
+index f7dc5fb94..055a9b3b6 100644
+--- a/arch/arm64/include/asm/ptrace.h
++++ b/arch/arm64/include/asm/ptrace.h
+@@ -193,8 +193,14 @@ static inline void forget_syscall(struct pt_regs *regs)
+ #define compat_thumb_mode(regs) (0)
+ #endif
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define user_mode(regs)	\
++	((((regs)->pstate & PSR_MODE_MASK) == PSR_MODE_EL0t) || \
++	 (((regs)->pstate & PSR_MODE_MASK) == PSR_MODE_EL1t))
++#else
+ #define user_mode(regs)	\
+ 	(((regs)->pstate & PSR_MODE_MASK) == PSR_MODE_EL0t)
++#endif
+ 
+ #define compat_user_mode(regs)	\
+ 	(((regs)->pstate & (PSR_MODE32_BIT | PSR_MODE_MASK)) == \
+diff --git a/arch/arm64/include/asm/thread_info.h b/arch/arm64/include/asm/thread_info.h
+index 5d7fe3e15..812b811b5 100644
+--- a/arch/arm64/include/asm/thread_info.h
++++ b/arch/arm64/include/asm/thread_info.h
+@@ -74,6 +74,9 @@ void arch_setup_new_exec(void);
+ #define TIF_SECCOMP		11	/* syscall secure computing */
+ #define TIF_SYSCALL_EMU		12	/* syscall emulation active */
+ #define TIF_PATCH_PENDING	13	/* pending live patching update */
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define TIF_KU			14	/* Kernel Mode Linux user task (EL1t) */
++#endif
+ #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
+ #define TIF_FREEZE		19
+ #define TIF_RESTORE_SIGMASK	20
+@@ -107,6 +110,9 @@ void arch_setup_new_exec(void);
+ #define _TIF_MTE_ASYNC_FAULT	(1 << TIF_MTE_ASYNC_FAULT)
+ #define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_TSC_SIGSEGV	(1 << TIF_TSC_SIGSEGV)
++#ifdef CONFIG_KERNEL_MODE_LINUX
++#define _TIF_KU			(1 << TIF_KU)
++#endif
+ 
+ #define _TIF_SYSCALL_WORK	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | \
+ 				 _TIF_SYSCALL_TRACEPOINT | _TIF_SECCOMP | \
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index 9f5bd9c69..3bf9244d0 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -164,6 +164,11 @@ static inline void __user *__uaccess_mask_ptr(const void __user *ptr)
+ {
+ 	void __user *safe_ptr;
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (unlikely(test_thread_flag(TIF_KU)))
++		return (void __user *)ptr;
++#endif
++
+ 	asm volatile(
+ 	"	bic	%0, %1, %2\n"
+ 	: "=r" (safe_ptr)
+@@ -236,7 +241,12 @@ do {									\
+ 	do {								\
+ 		__label__ __rgu_failed;					\
+ 		uaccess_ttbr0_enable();					\
+-		__raw_get_mem("ldtr", __rgu_val, __rgu_ptr, __rgu_failed, U);	\
++		if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&		\
++		    unlikely(test_thread_flag(TIF_KU)) &&		\
++		    ((unsigned long)__rgu_ptr & BIT(55)))		\
++			__raw_get_mem("ldr", __rgu_val, __rgu_ptr, __rgu_failed, K); \
++		else							\
++			__raw_get_mem("ldtr", __rgu_val, __rgu_ptr, __rgu_failed, U); \
+ 		uaccess_ttbr0_disable();				\
+ 		(x) = __rgu_val;					\
+ 		break;							\
+@@ -334,7 +344,12 @@ do {									\
+ 									\
+ 	do {								\
+ 		uaccess_ttbr0_enable();					\
+-		__raw_put_mem("sttr", __rpu_val, __rpu_ptr, __rpu_failed, U);	\
++		if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&		\
++		    unlikely(test_thread_flag(TIF_KU)) &&		\
++		    ((unsigned long)__rpu_ptr & BIT(55)))		\
++			__raw_put_mem("str", __rpu_val, __rpu_ptr, __rpu_failed, K); \
++		else							\
++			__raw_put_mem("sttr", __rpu_val, __rpu_ptr, __rpu_failed, U); \
+ 		uaccess_ttbr0_disable();				\
+ 		break;							\
+ 	__rpu_failed:							\
+@@ -393,10 +408,19 @@ extern unsigned long __must_check __arch_copy_from_user(void *to, const void __u
+ #define raw_copy_from_user(to, from, n)					\
+ ({									\
+ 	unsigned long __acfu_ret;					\
+-	uaccess_ttbr0_enable();						\
+-	__acfu_ret = __arch_copy_from_user((to),			\
+-				      __uaccess_mask_ptr(from), (n));	\
+-	uaccess_ttbr0_disable();					\
++	const void __user *__acfu_from = (from);			\
++	unsigned long __acfu_n = (n);					\
++	if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&			\
++	    unlikely(test_thread_flag(TIF_KU)) &&			\
++	    ((unsigned long)__acfu_from & BIT(55))) {			\
++		memcpy((to), (__force const void *)__acfu_from, __acfu_n); \
++		__acfu_ret = 0;						\
++	} else {							\
++		uaccess_ttbr0_enable();					\
++		__acfu_ret = __arch_copy_from_user((to),		\
++				      __uaccess_mask_ptr(__acfu_from), __acfu_n); \
++		uaccess_ttbr0_disable();				\
++	}								\
+ 	__acfu_ret;							\
+ })
+ 
+@@ -404,10 +428,19 @@ extern unsigned long __must_check __arch_copy_to_user(void __user *to, const voi
+ #define raw_copy_to_user(to, from, n)					\
+ ({									\
+ 	unsigned long __actu_ret;					\
+-	uaccess_ttbr0_enable();						\
+-	__actu_ret = __arch_copy_to_user(__uaccess_mask_ptr(to),	\
+-				    (from), (n));			\
+-	uaccess_ttbr0_disable();					\
++	void __user *__actu_to = (to);					\
++	unsigned long __actu_n = (n);					\
++	if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&			\
++	    unlikely(test_thread_flag(TIF_KU)) &&			\
++	    ((unsigned long)__actu_to & BIT(55))) {			\
++		memcpy((__force void *)__actu_to, (from), __actu_n);	\
++		__actu_ret = 0;						\
++	} else {							\
++		uaccess_ttbr0_enable();					\
++		__actu_ret = __arch_copy_to_user(__uaccess_mask_ptr(__actu_to), \
++				    (from), __actu_n);			\
++		uaccess_ttbr0_disable();				\
++	}								\
+ 	__actu_ret;							\
+ })
+ 
+@@ -462,6 +495,12 @@ extern unsigned long __must_check __arch_clear_user(void __user *to, unsigned lo
+ static inline unsigned long __must_check __clear_user(void __user *to, unsigned long n)
+ {
+ 	if (access_ok(to, n)) {
++		if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&
++		    unlikely(test_thread_flag(TIF_KU)) &&
++		    ((unsigned long)to & BIT(55))) {
++			memset((__force void *)to, 0, n);
++			return 0;
++		}
+ 		uaccess_ttbr0_enable();
+ 		n = __arch_clear_user(__uaccess_mask_ptr(to), n);
+ 		uaccess_ttbr0_disable();
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index 3ae3ad1a1..e8e149654 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -2193,6 +2193,7 @@ static bool has_bbml3(const struct arm64_cpu_capabilities *caps, int scope)
+ 	return cpu_supports_bbml3();
+ }
+ 
++#ifndef CONFIG_KERNEL_MODE_LINUX
+ static void cpu_enable_pan(const struct arm64_cpu_capabilities *__unused)
+ {
+ 	/*
+@@ -2204,6 +2205,7 @@ static void cpu_enable_pan(const struct arm64_cpu_capabilities *__unused)
+ 	sysreg_clear_set(sctlr_el1, SCTLR_EL1_SPAN, 0);
+ 	set_pstate_pan(1);
+ }
++#endif
+ 
+ #ifdef CONFIG_ARM64_RAS_EXTN
+ static void cpu_clear_disr(const struct arm64_cpu_capabilities *__unused)
+@@ -2593,6 +2595,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
+ 		.matches = has_cpuid_feature,
+ 		ARM64_CPUID_FIELDS(ID_AA64MMFR0_EL1, ECV, CNTPOFF)
+ 	},
++#ifndef CONFIG_KERNEL_MODE_LINUX
+ 	{
+ 		.desc = "Privileged Access Never",
+ 		.capability = ARM64_HAS_PAN,
+@@ -2610,6 +2613,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
+ 		ARM64_CPUID_FIELDS(ID_AA64MMFR1_EL1, PAN, PAN3)
+ 	},
+ #endif /* CONFIG_ARM64_EPAN */
++#endif /* !CONFIG_KERNEL_MODE_LINUX */
+ 	{
+ 		.desc = "LSE atomic instructions",
+ 		.capability = ARM64_HAS_LSE_ATOMICS,
+@@ -3076,6 +3080,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
+ 		.matches = has_cpuid_feature,
+ 		ARM64_CPUID_FIELDS(ID_AA64MMFR3_EL1, TCRX, IMP)
+ 	},
++#ifndef CONFIG_KERNEL_MODE_LINUX
+ 	{
+ 		.desc = "Stage-1 Permission Indirection Extension (S1PIE)",
+ 		.capability = ARM64_HAS_S1PIE,
+@@ -3083,6 +3088,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
+ 		.matches = has_cpuid_feature,
+ 		ARM64_CPUID_FIELDS(ID_AA64MMFR3_EL1, S1PIE, IMP)
+ 	},
++#endif
+ 	{
+ 		.desc = "VHE for hypervisor only",
+ 		.capability = ARM64_KVM_HVHE,
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+index 72c03ccea..3b51897b0 100644
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@ -327,10 +327,12 @@ static void debug_exception_exit(struct pt_regs *regs)
+ }
+ NOKPROBE_SYMBOL(debug_exception_exit);
+ 
++#ifndef CONFIG_KERNEL_MODE_LINUX
+ UNHANDLED(el1t, 64, sync)
+ UNHANDLED(el1t, 64, irq)
+ UNHANDLED(el1t, 64, fiq)
+ UNHANDLED(el1t, 64, error)
++#endif
+ 
+ static void noinstr el1_abort(struct pt_regs *regs, unsigned long esr)
+ {
+@@ -892,6 +894,96 @@ asmlinkage void noinstr el0t_64_error_handler(struct pt_regs *regs)
+ 	__el0_error_handler_common(regs);
+ }
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++/*
++ * AArch64 Kernel Mode Linux (EL1t / SPSel = 0) exception handlers.
++ * Hardware automatically switches to SP_EL1 upon vector entry, and entry.S
++ * invokes these between kernel_entry 0, 64 and ret_to_user (kernel_exit 0).
++ */
++asmlinkage void noinstr el1t_64_sync_handler(struct pt_regs *regs)
++{
++	unsigned long esr = read_sysreg(esr_el1);
++
++	switch (ESR_ELx_EC(esr)) {
++	case ESR_ELx_EC_SVC64:
++		el0_svc(regs);
++		break;
++	case ESR_ELx_EC_DABT_CUR:
++		el0_da(regs, esr);
++		break;
++	case ESR_ELx_EC_IABT_CUR:
++		el0_ia(regs, esr);
++		break;
++	case ESR_ELx_EC_FP_ASIMD:
++		el0_fpsimd_acc(regs, esr);
++		break;
++	case ESR_ELx_EC_SVE:
++		el0_sve_acc(regs, esr);
++		break;
++	case ESR_ELx_EC_SME:
++		el0_sme_acc(regs, esr);
++		break;
++	case ESR_ELx_EC_FP_EXC64:
++		el0_fpsimd_exc(regs, esr);
++		break;
++	case ESR_ELx_EC_SYS64:
++	case ESR_ELx_EC_WFx:
++		el0_sys(regs, esr);
++		break;
++	case ESR_ELx_EC_SP_ALIGN:
++		el0_sp(regs, esr);
++		break;
++	case ESR_ELx_EC_PC_ALIGN:
++		el0_pc(regs, esr);
++		break;
++	case ESR_ELx_EC_UNKNOWN:
++		el0_undef(regs, esr);
++		break;
++	case ESR_ELx_EC_BTI:
++		el0_bti(regs);
++		break;
++	case ESR_ELx_EC_MOPS:
++		el0_mops(regs, esr);
++		break;
++	case ESR_ELx_EC_GCS:
++		el0_gcs(regs, esr);
++		break;
++	case ESR_ELx_EC_BREAKPT_CUR:
++		el0_breakpt(regs, esr);
++		break;
++	case ESR_ELx_EC_SOFTSTP_CUR:
++		el0_softstp(regs, esr);
++		break;
++	case ESR_ELx_EC_WATCHPT_CUR:
++		el0_watchpt(regs, esr);
++		break;
++	case ESR_ELx_EC_BRK64:
++		el0_brk64(regs, esr);
++		break;
++	case ESR_ELx_EC_FPAC:
++		el0_fpac(regs, esr);
++		break;
++	default:
++		el0_inv(regs, esr);
++	}
++}
++
++asmlinkage void noinstr el1t_64_irq_handler(struct pt_regs *regs)
++{
++	__el0_irq_handler_common(regs);
++}
++
++asmlinkage void noinstr el1t_64_fiq_handler(struct pt_regs *regs)
++{
++	__el0_fiq_handler_common(regs);
++}
++
++asmlinkage void noinstr el1t_64_error_handler(struct pt_regs *regs)
++{
++	__el0_error_handler_common(regs);
++}
++#endif /* CONFIG_KERNEL_MODE_LINUX */
++
+ #ifdef CONFIG_COMPAT
+ static void noinstr el0_cp15(struct pt_regs *regs, unsigned long esr)
+ {
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index f63049ac3..762a36222 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -373,7 +373,17 @@ alternative_if ARM64_WORKAROUND_845719
+ #endif
+ alternative_else_nop_endif
+ #endif
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	b	4f
++#endif
+ 3:
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	and	x0, x22, #PSR_MODE_MASK
++	cmp	x0, #PSR_MODE_EL1t
++	cset	x0, eq
++	msr	tpidrro_el0, x0
++4:
++#endif
+ 	/* Ignore asynchronous tag check faults in the uaccess routines */
+ 	ldr	x0, [tsk, THREAD_SCTLR_USER]
+ 	clear_mte_async_tcf x0
+@@ -577,10 +587,26 @@ SYM_CODE_END(el\el\ht\()_\regsize\()_\label)
+ /*
+  * Early exception handlers
+  */
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	.macro kml_el1t_handler label:req
++SYM_CODE_START_LOCAL(el1t_64_\label)
++	kernel_entry 0, 64
++	mov	x0, sp
++	bl	el1t_64_\label\()_handler
++	b	ret_to_user
++SYM_CODE_END(el1t_64_\label)
++	.endm
++
++	kml_el1t_handler	sync
++	kml_el1t_handler	irq
++	kml_el1t_handler	fiq
++	kml_el1t_handler	error
++#else
+ 	entry_handler	1, t, 64, sync
+ 	entry_handler	1, t, 64, irq
+ 	entry_handler	1, t, 64, fiq
+ 	entry_handler	1, t, 64, error
++#endif
+ 
+ 	entry_handler	1, h, 64, sync
+ 	entry_handler	1, h, 64, irq
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index 581f80e9b..f1cadf11d 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -434,6 +434,11 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 	if (likely(!args->fn)) {
+ 		*childregs = *current_pt_regs();
+ 		childregs->regs[0] = 0;
++#ifdef CONFIG_KERNEL_MODE_LINUX
++		if (test_ti_thread_flag(task_thread_info(p), TIF_KU))
++			childregs->pstate = (childregs->pstate & ~PSR_MODE_MASK) |
++					    PSR_MODE_EL1t;
++#endif
+ 
+ 		/*
+ 		 * Read the current TLS pointer from tpidr_el0 as it may be
+@@ -497,6 +502,9 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 		 * When a user task is created from a kthread, childregs will
+ 		 * be initialized by start_thread() or start_compat_thread().
+ 		 */
++#ifdef CONFIG_KERNEL_MODE_LINUX
++		clear_tsk_thread_flag(p, TIF_KU);
++#endif
+ 		memset(childregs, 0, sizeof(struct pt_regs));
+ 		childregs->pstate = PSR_MODE_EL1h | PSR_IL_BIT;
+ 		childregs->stackframe.type = FRAME_META_TYPE_FINAL;
+@@ -533,6 +541,9 @@ static void tls_thread_switch(struct task_struct *next)
+ 
+ 	if (is_compat_thread(task_thread_info(next)))
+ 		write_sysreg(next->thread.uw.tp_value, tpidrro_el0);
++	else if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) &&
++		 test_ti_thread_flag(task_thread_info(next), TIF_KU))
++		write_sysreg(1, tpidrro_el0);
+ 	else
+ 		write_sysreg(0, tpidrro_el0);
+ 
+diff --git a/arch/arm64/kernel/ptrace.c b/arch/arm64/kernel/ptrace.c
+index f743cbec1..6bd7c8961 100644
+--- a/arch/arm64/kernel/ptrace.c
++++ b/arch/arm64/kernel/ptrace.c
+@@ -2545,11 +2545,19 @@ static int valid_compat_regs(struct user_pt_regs *regs)
+ 	return 0;
+ }
+ 
+-static int valid_native_regs(struct user_pt_regs *regs)
++static int valid_native_regs(struct user_pt_regs *regs, struct task_struct *task)
+ {
++	unsigned long expected_mode = PSR_MODE_EL0t;
++
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (test_ti_thread_flag(task_thread_info(task), TIF_KU))
++		expected_mode = PSR_MODE_EL1t;
++#endif
++
+ 	regs->pstate &= ~SPSR_EL1_AARCH64_RES0_BITS;
+ 
+-	if (user_mode(regs) && !(regs->pstate & PSR_MODE32_BIT) &&
++	if (((regs->pstate & PSR_MODE_MASK) == expected_mode) &&
++	    !(regs->pstate & PSR_MODE32_BIT) &&
+ 	    (regs->pstate & PSR_D_BIT) == 0 &&
+ 	    (regs->pstate & PSR_A_BIT) == 0 &&
+ 	    (regs->pstate & PSR_I_BIT) == 0 &&
+@@ -2557,8 +2565,9 @@ static int valid_native_regs(struct user_pt_regs *regs)
+ 		return 1;
+ 	}
+ 
+-	/* Force PSR to a valid 64-bit EL0t */
++	/* Force PSR to a valid 64-bit user mode (EL0t, or EL1t for TIF_KU) */
+ 	regs->pstate &= PSR_N_BIT | PSR_Z_BIT | PSR_C_BIT | PSR_V_BIT;
++	regs->pstate |= expected_mode;
+ 
+ 	return 0;
+ }
+@@ -2575,5 +2584,5 @@ int valid_user_regs(struct user_pt_regs *regs, struct task_struct *task)
+ 	if (is_compat_thread(task_thread_info(task)))
+ 		return valid_compat_regs(regs);
+ 	else
+-		return valid_native_regs(regs);
++		return valid_native_regs(regs, task);
+ }
+diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
+index 6a06a4e35..935362ac5 100644
+--- a/arch/arm64/kernel/signal.c
++++ b/arch/arm64/kernel/signal.c
+@@ -1530,6 +1530,11 @@ static int setup_return(struct pt_regs *regs, struct ksignal *ksig,
+ 	/* TCO (Tag Check Override) always cleared for signal handlers */
+ 	regs->pstate &= ~PSR_TCO_BIT;
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (unlikely(test_thread_flag(TIF_KU)))
++		regs->pstate = (regs->pstate & ~PSR_MODE_MASK) | PSR_MODE_EL1t;
++#endif
++
+ 	/* Signal handlers are invoked with ZA and streaming mode disabled */
+ 	if (system_supports_sme()) {
+ 		task_smstop_sm(current);
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 75c3e463d..8a16cc62b 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -283,6 +283,9 @@ static bool is_el1_data_abort(unsigned long esr)
+ static inline bool is_el1_permission_fault(unsigned long addr, unsigned long esr,
+ 					   struct pt_regs *regs)
+ {
++	if (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) && user_mode(regs))
++		return false;
++
+ 	if (!is_el1_data_abort(esr) && !is_el1_instruction_abort(esr))
+ 		return false;
+ 
+@@ -477,6 +480,7 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
+ 	if (!is_ttbr0_addr(current->thread.fault_address)) {
+ 		switch (ESR_ELx_EC(esr)) {
+ 		case ESR_ELx_EC_DABT_LOW:
++		case ESR_ELx_EC_DABT_CUR:
+ 			/*
+ 			 * These bits provide only information about the
+ 			 * faulting instruction, which userspace knows already.
+@@ -491,6 +495,7 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
+ 			esr |= ESR_ELx_FSC_FAULT;
+ 			break;
+ 		case ESR_ELx_EC_IABT_LOW:
++		case ESR_ELx_EC_IABT_CUR:
+ 			/*
+ 			 * Claim a level 0 translation fault.
+ 			 * All other bits are architecturally RES0 for faults
+@@ -634,7 +639,9 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
+ 	 * vma->vm_flags & vm_flags and returns an error if the
+ 	 * intersection is empty
+ 	 */
+-	if (is_el0_instruction_abort(esr)) {
++	if (is_el0_instruction_abort(esr) ||
++	    (IS_ENABLED(CONFIG_KERNEL_MODE_LINUX) && user_mode(regs) &&
++	     is_el1_instruction_abort(esr))) {
+ 		/* It was exec fault */
+ 		vm_flags = VM_EXEC;
+ 		mm_flags |= FAULT_FLAG_INSTRUCTION;
+diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
+index 12aacc74f..b17f57562 100644
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@ -546,6 +546,7 @@ alternative_else_nop_endif
+ 	msr	mair_el1, mair
+ 	msr	tcr_el1, tcr
+ 
++#ifndef CONFIG_KERNEL_MODE_LINUX
+ 	mrs_s	x1, SYS_ID_AA64MMFR3_EL1
+ 	ubfx	x1, x1, #ID_AA64MMFR3_EL1_S1PIE_SHIFT, #4
+ 	cbz	x1, .Lskip_indirection
+@@ -558,6 +559,7 @@ alternative_else_nop_endif
+ 	orr	tcr2, tcr2, TCR2_EL1_PIE
+ 
+ .Lskip_indirection:
++#endif
+ 
+ 	mrs_s	x1, SYS_ID_AA64MMFR3_EL1
+ 	ubfx	x1, x1, #ID_AA64MMFR3_EL1_TCRX_SHIFT, #4
 diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
 index 15fd9ec5e..8d867090a 100644
 --- a/arch/x86/Kconfig
@@ -1335,10 +2046,10 @@ index 000000000..80a714119
 +#endif /* _LINUX_KML_H */
 diff --git a/kernel/Kconfig.kml b/kernel/Kconfig.kml
 new file mode 100644
-index 000000000..dcd3b54af
+index 000000000..50fc5694a
 --- /dev/null
 +++ b/kernel/Kconfig.kml
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,41 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +
 +config ARCH_SUPPORTS_KML
@@ -1351,10 +2062,11 @@ index 000000000..dcd3b54af
 +	bool "Kernel Mode Linux"
 +	help
 +	  This enables Kernel Mode Linux. In Kernel Mode Linux, trusted user
-+	  programs can be executed in kernel mode (CPU Ring 0 on x86_64, or
-+	  SYSTEM_MODE on ARM) and access kernel address space directly. Thus,
-+	  costly privilege-level switches between user mode and kernel mode can
-+	  be eliminated for real-time or latency-critical workloads.
++	  programs can be executed in kernel mode (CPU Ring 0 on x86_64, EL1t
++	  on AArch64, or SYSTEM_MODE on ARM) and access kernel address space
++	  directly. Thus, costly privilege-level switches between user mode and
++	  kernel mode can be eliminated for real-time or latency-critical
++	  workloads.
 +
 +	  More information about Kernel Mode Linux can be found in
 +	  <file:Documentation/admin-guide/kml.rst>.
@@ -1407,5 +2119,5 @@ index dffef52a8..231baab6e 100644
  
  /* NB: reg/unreg are called while guarded with the tracepoints_mutex */
 -- 
-2.56.1.708.g77570a6a1d-goog
+2.56.1.750.gf70dc682cf-goog
 

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Comprehensive verification suite for Kernel Mode Linux (KML) on Linux 7.3.
+ * Comprehensive verification suite for Kernel Mode Linux (KML) on Linux 7.3
+ * (x86_64 Ring 0 & AArch64 EL1t).
  *
- * Linked against arch/x86/entry/vdso/vdso64/vdso64.so so KML symbols resolve
- * to version LINUX_2.6 in the kernel-mapped [vdso].
+ * Linked against the kernel-built vDSO shared object (vdso64.so on x86_64,
+ * vdso.so on arm64) so KML symbols resolve to the kernel-mapped [vdso].
  */
 
 #define _GNU_SOURCE
@@ -22,7 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Symbols exported by the Linux 7.3 KML vDSO (LINUX_2.6) */
+/* Symbols exported by the Linux 7.3 KML vDSO */
 extern signed long kernel_sched_timeout(signed long timeout);
 extern long trace_call_by_kml(void);
 extern long kml_syscall(long nr, unsigned long a0, unsigned long a1,
@@ -31,6 +32,8 @@ extern long kml_syscall(long nr, unsigned long a0, unsigned long a1,
 extern long kml_call(unsigned long fn, unsigned long a0, unsigned long a1,
 		     unsigned long a2, unsigned long a3, unsigned long a4,
 		     unsigned long a5);
+
+#if defined(__x86_64__)
 
 static inline uint16_t read_cs(void)
 {
@@ -48,13 +51,71 @@ static inline uint16_t read_ss(void)
 	return ss;
 }
 
-static inline uint64_t read_cr3(void)
+static inline uint64_t read_priv_pagetable_reg(void)
 {
 	uint64_t cr3;
 
 	__asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
 	return cr3;
 }
+
+static inline int is_kernel_mode_safe(void)
+{
+	return (read_cs() & 3) == 0;
+}
+
+static inline int is_user_mode_safe(void)
+{
+	return (read_cs() & 3) == 3;
+}
+
+#elif defined(__aarch64__)
+
+static inline uint64_t read_tpidrro_el0(void)
+{
+	uint64_t val;
+
+	__asm__ volatile("mrs %0, tpidrro_el0" : "=r"(val));
+	return val;
+}
+
+static inline uint64_t read_current_el(void)
+{
+	uint64_t el;
+
+	__asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
+	return (el >> 2) & 3;
+}
+
+static inline uint64_t read_spsel(void)
+{
+	uint64_t spsel;
+
+	__asm__ volatile("mrs %0, SPSel" : "=r"(spsel));
+	return spsel & 1;
+}
+
+static inline uint64_t read_priv_pagetable_reg(void)
+{
+	uint64_t ttbr1;
+
+	__asm__ volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+	return ttbr1;
+}
+
+static inline int is_kernel_mode_safe(void)
+{
+	return (read_tpidrro_el0() & 1) != 0;
+}
+
+static inline int is_user_mode_safe(void)
+{
+	return (read_tpidrro_el0() & 1) == 0;
+}
+
+#else
+#error "Unsupported architecture for kml_test.c"
+#endif
 
 static unsigned long lookup_kallsymbol(const char *target)
 {
@@ -82,16 +143,26 @@ static unsigned long lookup_kallsymbol(const char *target)
 }
 
 static volatile sig_atomic_t sig_fired;
+#if defined(__x86_64__)
 static volatile uint16_t sig_handler_cs;
+#elif defined(__aarch64__)
+static volatile uint64_t sig_handler_el;
+static volatile uint64_t sig_handler_spsel;
+#endif
 
 static void sigusr1_handler(int signo)
 {
 	(void)signo;
+#if defined(__x86_64__)
 	sig_handler_cs = read_cs();
+#elif defined(__aarch64__)
+	sig_handler_el = is_kernel_mode_safe() ? read_current_el() : 0;
+	sig_handler_spsel = is_kernel_mode_safe() ? read_spsel() : 1;
+#endif
 	sig_fired = 1;
 }
 
-/* Recursively touch 128 KiB of fresh stack pages to exercise Ring-0 stack #PF */
+/* Recursively touch 128 KiB of fresh stack pages to exercise KML stack #PF */
 static __attribute__((noinline)) uint64_t touch_deep_stack(int depth)
 {
 	volatile char page_buf[4096];
@@ -103,16 +174,42 @@ static __attribute__((noinline)) uint64_t touch_deep_stack(int depth)
 	return (uint64_t)page_buf[0] + touch_deep_stack(depth - 1);
 }
 
+static int check_priv_insn_faults_in_child(int *out_sig)
+{
+	int status = 0;
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		perror("fork");
+		return -1;
+	}
+	if (pid == 0) {
+#if defined(__x86_64__)
+		volatile uint64_t v = read_priv_pagetable_reg();
+#elif defined(__aarch64__)
+		volatile uint64_t v = read_current_el();
+#endif
+		(void)v;
+		_exit(0);
+	}
+	if (waitpid(pid, &status, 0) < 0 || !WIFSIGNALED(status))
+		return -1;
+	if (out_sig)
+		*out_sig = WTERMSIG(status);
+	return 0;
+}
+
 static int run_expect_user_tests(const char *label)
 {
-	uint16_t cs = read_cs();
-	uint16_t ss = read_ss();
-	int cpl = cs & 3;
 	struct timespec ts = {0, 0};
 	struct timeval tv = {0, 0};
 	struct timespec req = {0, 1000000};
-	pid_t pid;
-	int status = 0;
+	int term_sig = 0;
+
+#if defined(__x86_64__)
+	uint16_t cs = read_cs();
+	uint16_t ss = read_ss();
+	int cpl = cs & 3;
 
 	printf("[%s] CS=0x%04x SS=0x%04x CPL=%d\n", label, cs, ss, cpl);
 	if (cpl != 3) {
@@ -120,55 +217,60 @@ static int run_expect_user_tests(const char *label)
 			label, cpl);
 		return 1;
 	}
+#elif defined(__aarch64__)
+	uint64_t tpidrro = read_tpidrro_el0();
 
-	/* Verify privileged instructions fault in Ring 3 */
-	pid = fork();
-	if (pid < 0) {
-		perror("fork");
+	printf("[%s] TPIDRRO_EL0=0x%lx mode=%s\n", label,
+	       (unsigned long)tpidrro,
+	       ((tpidrro & 1) == 0) ? "EL0t" : "EL1t");
+	if ((tpidrro & 1) != 0) {
+		fprintf(stderr, "FAIL [%s]: expected EL0t (TPIDRRO_EL0=0), got 0x%lx\n",
+			label, (unsigned long)tpidrro);
 		return 1;
 	}
-	if (pid == 0) {
-		volatile uint64_t cr3 = read_cr3();
-		(void)cr3;
-		_exit(0);
-	}
-	if (waitpid(pid, &status, 0) < 0 || !WIFSIGNALED(status)) {
-		fprintf(stderr, "FAIL [%s]: reading CR3 in Ring 3 did not fault!\n",
+#endif
+
+	/* Verify privileged instructions fault in unprivileged user mode */
+	if (check_priv_insn_faults_in_child(&term_sig) != 0) {
+		fprintf(stderr, "FAIL [%s]: privileged register read in user mode did not fault!\n",
 			label);
 		return 1;
 	}
+#if defined(__x86_64__)
 	printf("  [PASS] Ring-3 privileged instruction (mov %%cr3) blocked by CPU (sig=%d)\n",
-	       WTERMSIG(status));
+	       term_sig);
+#elif defined(__aarch64__)
+	printf("  [PASS] EL0t privileged instruction (mrs CurrentEL) blocked by CPU (sig=%d)\n",
+	       term_sig);
+#endif
 
-	/* Verify KML-only vDSO entry points return -EPERM in Ring 3 */
+	/* Verify KML-only vDSO entry points return -EPERM in user mode */
 	if (kernel_sched_timeout(1) != -EPERM ||
 	    trace_call_by_kml() != -EPERM ||
-	    kml_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0) != -EPERM) {
-		fprintf(stderr, "FAIL [%s]: KML vDSO entry points did not return -EPERM in Ring 3\n",
+	    kml_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0) != -EPERM ||
+	    kml_call(0x1000, 0, 0, 0, 0, 0, 0) != -EPERM) {
+		fprintf(stderr, "FAIL [%s]: KML vDSO entry points did not return -EPERM in user mode\n",
 			label);
 		return 1;
 	}
-	printf("  [PASS] KML vDSO entry points safely reject Ring-3 callers (-EPERM)\n");
+	printf("  [PASS] KML vDSO entry points safely reject unprivileged callers (-EPERM)\n");
 
-	/* Verify normal vDSO calls still work in Ring 3 */
+	/* Verify normal vDSO calls still work in user mode */
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 ||
 	    gettimeofday(&tv, NULL) != 0 ||
 	    sched_yield() != 0 ||
 	    nanosleep(&req, NULL) != 0) {
-		fprintf(stderr, "FAIL [%s]: standard vDSO calls failed in Ring 3\n",
+		fprintf(stderr, "FAIL [%s]: standard vDSO calls failed in user mode\n",
 			label);
 		return 1;
 	}
-	printf("  [PASS] Standard vDSO (clock_gettime/gettimeofday/sched_yield/nanosleep) OK in Ring 3\n");
+	printf("  [PASS] Standard vDSO (clock_gettime/gettimeofday/sched_yield/nanosleep) OK in user mode\n");
 	return 0;
 }
 
 static int run_expect_kernel_tests(void)
 {
-	uint16_t cs = read_cs();
-	uint16_t ss = read_ss();
-	int cpl = cs & 3;
-	uint64_t cr3;
+	uint64_t pt_reg;
 	unsigned long banner_addr, trace_fn_addr;
 	struct timespec ts1 = {0, 0}, ts2 = {0, 0}, req = {0, 2000000};
 	struct timeval tv = {0, 0};
@@ -178,6 +280,11 @@ static int run_expect_kernel_tests(void)
 	int status = 0;
 	struct sigaction sa;
 
+#if defined(__x86_64__)
+	uint16_t cs = read_cs();
+	uint16_t ss = read_ss();
+	int cpl = cs & 3;
+
 	printf("[trusted-kml] CS=0x%04x SS=0x%04x CPL=%d\n", cs, ss, cpl);
 	if (cpl != 0) {
 		fprintf(stderr, "FAIL [trusted-kml]: expected Ring 0 (CPL=0), got CPL=%d\n",
@@ -186,15 +293,35 @@ static int run_expect_kernel_tests(void)
 	}
 	printf("  [PASS] Executing user ELF binary in CPU Ring 0 (CS=0x%04x, SS=0x%04x)\n",
 	       cs, ss);
+#elif defined(__aarch64__)
+	uint64_t tpidrro = read_tpidrro_el0();
+	uint64_t el = read_current_el();
+	uint64_t spsel = read_spsel();
 
-	/* 1. Privileged register access in Ring 0 */
-	cr3 = read_cr3();
-	if (cr3 == 0) {
-		fprintf(stderr, "FAIL [trusted-kml]: unexpected zero CR3\n");
+	printf("[trusted-kml] CurrentEL=EL%lu SPSel=%lu TPIDRRO_EL0=0x%lx\n",
+	       (unsigned long)el, (unsigned long)spsel, (unsigned long)tpidrro);
+	if (el != 1 || spsel != 0 || (tpidrro & 1) == 0) {
+		fprintf(stderr, "FAIL [trusted-kml]: expected EL1t (EL=1, SPSel=0, TPIDRRO=1), got EL=%lu SPSel=%lu TPIDRRO=0x%lx\n",
+			(unsigned long)el, (unsigned long)spsel,
+			(unsigned long)tpidrro);
 		return 1;
 	}
+	printf("  [PASS] Executing user ELF binary in AArch64 EL1t (CurrentEL=EL1, SPSel=0)\n");
+#endif
+
+	/* 1. Privileged page-table register access from user space */
+	pt_reg = read_priv_pagetable_reg();
+	if (pt_reg == 0) {
+		fprintf(stderr, "FAIL [trusted-kml]: unexpected zero privileged page-table register\n");
+		return 1;
+	}
+#if defined(__x86_64__)
 	printf("  [PASS] Direct Ring-0 CR3 read from user space: CR3=0x%016lx\n",
-	       (unsigned long)cr3);
+	       (unsigned long)pt_reg);
+#elif defined(__aarch64__)
+	printf("  [PASS] Direct EL1t TTBR1_EL1 read from user space: TTBR1_EL1=0x%016lx\n",
+	       (unsigned long)pt_reg);
+#endif
 
 	/* 2. Direct kernel address space read + passing kernel pointer to syscall */
 	banner_addr = lookup_kallsymbol("linux_banner");
@@ -243,7 +370,7 @@ static int run_expect_kernel_tests(void)
 			kpid, getpid());
 		return 1;
 	}
-	printf("  [PASS] vDSO direct Ring-0 syscall dispatch: kml_syscall(getpid)=%ld, clock_gettime/gettimeofday/sched_yield/nanosleep OK\n",
+	printf("  [PASS] vDSO direct kernel syscall dispatch: kml_syscall(getpid)=%ld, clock_gettime/gettimeofday/sched_yield/nanosleep OK\n",
 	       kpid);
 
 	/* 4. Direct kernel scheduler sleep via vDSO kernel_sched_timeout */
@@ -307,7 +434,7 @@ static int run_expect_kernel_tests(void)
 		}
 	}
 
-	/* 6. Demand paging & deep user-stack page faults in Ring 0 (IST_INDEX_KML) */
+	/* 6. Demand paging & deep user-stack page faults in kernel mode */
 	map = mmap(NULL, 1024 * 1024, PROT_READ | PROT_WRITE,
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (map == MAP_FAILED) {
@@ -322,9 +449,9 @@ static int run_expect_kernel_tests(void)
 		fprintf(stderr, "FAIL [trusted-kml]: unexpected stack checksum\n");
 		return 1;
 	}
-	printf("  [PASS] Ring-0 anonymous mmap & 128 KiB stack-growth demand #PFs handled via IST_INDEX_KML\n");
+	printf("  [PASS] Kernel-mode anonymous mmap & 128 KiB stack-growth demand #PFs handled cleanly\n");
 
-	/* 7. Signal delivery & rt_sigreturn preserve Ring 0 */
+	/* 7. Signal delivery & rt_sigreturn preserve kernel mode */
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = sigusr1_handler;
 	if (sigaction(SIGUSR1, &sa, NULL) != 0) {
@@ -332,6 +459,7 @@ static int run_expect_kernel_tests(void)
 		return 1;
 	}
 	raise(SIGUSR1);
+#if defined(__x86_64__)
 	if (!sig_fired || (sig_handler_cs & 3) != 0 || (read_cs() & 3) != 0) {
 		fprintf(stderr, "FAIL [trusted-kml]: signal lost Ring 0 (handler_cs=0x%x, post_cs=0x%x)\n",
 			sig_handler_cs, read_cs());
@@ -339,16 +467,32 @@ static int run_expect_kernel_tests(void)
 	}
 	printf("  [PASS] Signal handler & rt_sigreturn preserved Ring 0 (handler CS=0x%04x, post CS=0x%04x)\n",
 	       sig_handler_cs, read_cs());
+#elif defined(__aarch64__)
+	if (!sig_fired || sig_handler_el != 1 || sig_handler_spsel != 0 ||
+	    read_current_el() != 1 || read_spsel() != 0 || !is_kernel_mode_safe()) {
+		fprintf(stderr, "FAIL [trusted-kml]: signal lost EL1t (handler_el=%lu, post_el=%lu)\n",
+			(unsigned long)sig_handler_el,
+			(unsigned long)read_current_el());
+		return 1;
+	}
+	printf("  [PASS] Signal handler & rt_sigreturn preserved EL1t (handler EL=EL%lu, post EL=EL%lu)\n",
+	       (unsigned long)sig_handler_el, (unsigned long)read_current_el());
+#endif
 
-	/* 8. fork() preserves Ring 0 in child, and execve() outside /trusted drops to Ring 3 */
+	/* 8. fork() preserves kernel mode in child, and execve() outside /trusted drops to user mode */
 	pid = fork();
 	if (pid < 0) {
 		perror("fork");
 		return 1;
 	}
 	if (pid == 0) {
+#if defined(__x86_64__)
 		if ((read_cs() & 3) != 0)
 			_exit(2);
+#elif defined(__aarch64__)
+		if (!is_kernel_mode_safe() || read_current_el() != 1 || read_spsel() != 0)
+			_exit(2);
+#endif
 		execl("/bin/kml_test", "kml_test", "--expect-user-quiet", NULL);
 		_exit(3);
 	}
@@ -357,9 +501,9 @@ static int run_expect_kernel_tests(void)
 			status);
 		return 1;
 	}
-	printf("  [PASS] fork() inherited Ring 0 & execve(/bin/kml_test) cleanly dropped back to Ring 3\n");
+	printf("  [PASS] fork() inherited kernel mode & execve(/bin/kml_test) cleanly dropped back to user mode\n");
 
-	/* 9. Cross-CPU task migration in Ring 0 (both syscall and sleeping vDSO paths) */
+	/* 9. Cross-CPU task migration in kernel mode (both syscall and sleeping vDSO paths) */
 	{
 		long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
 
@@ -387,15 +531,29 @@ static int run_expect_kernel_tests(void)
 					fprintf(stderr, "FAIL [trusted-kml]: vDSO sleep/yield during CPU migration failed\n");
 					return 1;
 				}
-				if (read_cs() != cs || read_cr3() == 0) {
+#if defined(__x86_64__)
+				if (read_cs() != cs || read_priv_pagetable_reg() == 0) {
 					fprintf(stderr, "FAIL [trusted-kml]: lost __KML_CS after migrating to CPU %d (CS=0x%x)\n",
 						target, read_cs());
 					return 1;
 				}
+#elif defined(__aarch64__)
+				if (!is_kernel_mode_safe() || read_current_el() != 1 ||
+				    read_spsel() != 0 || read_priv_pagetable_reg() == 0) {
+					fprintf(stderr, "FAIL [trusted-kml]: lost EL1t after migrating to CPU %d\n",
+						target);
+					return 1;
+				}
+#endif
 			}
 			(void)sched_setaffinity(0, sizeof(full_set), &full_set);
+#if defined(__x86_64__)
 			printf("  [PASS] Cross-CPU Ring-0 migration across %ld CPUs preserved CS=0x%04x & GSBASE\n",
 			       ncpus, read_cs());
+#elif defined(__aarch64__)
+			printf("  [PASS] Cross-CPU EL1t migration across %ld CPUs preserved CurrentEL=EL1, SPSel=0 & TPIDRRO_EL0\n",
+			       ncpus);
+#endif
 		}
 	}
 
@@ -410,14 +568,30 @@ int main(int argc, char **argv)
 	if (argc >= 2 && strcmp(argv[1], "--expect-chroot-user") == 0)
 		return run_expect_user_tests("chroot-trusted");
 
-	if (argc >= 2 && strcmp(argv[1], "--expect-user-quiet") == 0)
-		return ((read_cs() & 3) == 3) ? 0 : 1;
+	if (argc >= 2 && strcmp(argv[1], "--expect-user-quiet") == 0) {
+		if (!is_user_mode_safe())
+			return 1;
+		return (check_priv_insn_faults_in_child(NULL) == 0) ? 0 : 1;
+	}
 
 	if (argc >= 2 && strcmp(argv[1], "--expect-kernel") == 0)
 		return run_expect_kernel_tests();
 
+#if defined(__x86_64__)
 	printf("PID=%d CS=0x%04x SS=0x%04x CPL=%d (%s)\n",
 	       getpid(), read_cs(), read_ss(), read_cs() & 3,
-	       ((read_cs() & 3) == 0) ? "KERNEL MODE (Ring 0)" : "USER MODE (Ring 3)");
+	       is_kernel_mode_safe() ? "KERNEL MODE (Ring 0)" : "USER MODE (Ring 3)");
+#elif defined(__aarch64__)
+	if (is_kernel_mode_safe()) {
+		printf("PID=%d CurrentEL=EL%lu SPSel=%lu (%s)\n",
+		       getpid(), (unsigned long)read_current_el(),
+		       (unsigned long)read_spsel(),
+		       "KERNEL MODE (EL1t)");
+	} else {
+		printf("PID=%d TPIDRRO_EL0=0x%lx (%s)\n",
+		       getpid(), (unsigned long)read_tpidrro_el0(),
+		       "USER MODE (EL0t)");
+	}
+#endif
 	return 0;
 }

@@ -1,34 +1,43 @@
-From bad35aef8f249a2489d1051f7ae5249b3f39a920 Mon Sep 17 00:00:00 2001
+From 6b41bfb4b8ebadb6b37add7c33949d61a8dff0c7 Mon Sep 17 00:00:00 2001
 From: Christian Blichmann <cblichmann@google.com>
 Date: Thu, 19 Nov 2026 12:25:56 +0100
 Subject: [PATCH 2/2] Use VDSO as the wrapper for KML resource
 
-Expose direct kernel call wrappers through the vDSO on x86_64 and ARM
-when CONFIG_KERNEL_MODE_LINUX is enabled:
+Expose direct kernel call wrappers through the vDSO on x86_64, AArch64,
+and ARM when CONFIG_KERNEL_MODE_LINUX is enabled:
 
 - Populate KML dispatch pointers (kml_trampoline, sys_call_table,
   schedule_timeout_interruptible, trace_call_by_kml) in vdso_time_data
   while preserving standard vDSO timekeeping for unprivileged Ring-3 /
-  USR_MODE tasks.
-- Add kml_trampoline / __kml_trampoline on x86_64 to switch GSBASE and
-  RSP onto the task kernel stack in Ring 0 without privilege traps.
+  EL0t / USR_MODE tasks.
+- Add kml_trampoline / __kml_trampoline on x86_64 (switching GSBASE, RSP,
+  and __KML_CS <-> __KERNEL_CS) and AArch64 (switching SPSel=0 <-> SPSel=1
+  and SP_EL0 onto the task kernel stack) without privilege traps.
 - Export clock_gettime, gettimeofday, sched_yield, nanosleep,
   kernel_sched_timeout, trace_call_by_kml, kml_syscall, and kml_call
-  under LINUX_2.6 in the vDSO.
+  in the vDSO (LINUX_2.6 on x86_64/ARM, LINUX_2.6.39 on AArch64).
 ---
  arch/arm/kernel/vdso.c                      |  13 +-
  arch/arm/vdso/vdso.lds.S                    |  14 ++
- arch/arm/vdso/vgettimeofday.c               | 125 +++++++++++++++-
- arch/x86/entry/entry_64.S                   |  66 +++++++++
+ arch/arm/vdso/vgettimeofday.c               | 125 ++++++++++++++-
+ arch/arm64/kernel/entry.S                   |  48 ++++++
+ arch/arm64/kernel/syscall.c                 |  39 +++++
+ arch/arm64/kernel/vdso.c                    |  22 ++-
+ arch/arm64/kernel/vdso/Makefile             |   4 +
+ arch/arm64/kernel/vdso/vdso.lds.S           |  18 +++
+ arch/arm64/kernel/vdso/vgettimeofday.c      |  40 +++++
+ arch/arm64/kernel/vdso/vkml.c               | 162 ++++++++++++++++++++
+ arch/x86/entry/entry_64.S                   |  66 ++++++++
  arch/x86/entry/syscall_64.c                 |  38 +++++
  arch/x86/entry/vdso/common/vclock_gettime.c |  26 ++++
  arch/x86/entry/vdso/vdso64/Makefile         |   1 +
  arch/x86/entry/vdso/vdso64/vdso64.lds.S     |  15 ++
- arch/x86/entry/vdso/vdso64/vkml.c           | 150 ++++++++++++++++++++
+ arch/x86/entry/vdso/vdso64/vkml.c           | 150 ++++++++++++++++++
  arch/x86/entry/vdso/vma.c                   |  15 ++
  include/linux/kml.h                         |   6 +
  include/vdso/datapage.h                     |  19 +++
- 12 files changed, 486 insertions(+), 2 deletions(-)
+ 19 files changed, 818 insertions(+), 3 deletions(-)
+ create mode 100644 arch/arm64/kernel/vdso/vkml.c
  create mode 100644 arch/x86/entry/vdso/vdso64/vkml.c
 
 diff --git a/arch/arm/kernel/vdso.c b/arch/arm/kernel/vdso.c
@@ -270,6 +279,451 @@ index 3eebeddbf..4fb0ec780 100644
  	return __cvdso_clock_gettime(clock, ts);
  }
  
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index 762a36222..53d4e3b9a 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -923,6 +923,54 @@ SYM_FUNC_START(call_on_irq_stack)
+ SYM_FUNC_END(call_on_irq_stack)
+ NOKPROBE(call_on_irq_stack)
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++/*
++ * Direct EL1t kernel call entry from KML user space (invoked via vDSO).
++ *   x0  : pointer to struct kml_call_args on caller stack
++ *   x30 : caller return PC in EL1t
++ *
++ * Switches from EL1t (SPSel = 0, SP_EL0 = user_sp) to EL1h (SPSel = 1,
++ * SP_EL1 = task kernel stack below task_pt_regs(current), SP_EL0 = current)
++ * without privilege traps, invokes __kml_trampoline(), and restores SP_EL0 +
++ * SPSel = 0 before returning.
++ */
++SYM_FUNC_START(kml_trampoline)
++	mrs	x9, SPSel
++	cbnz	x9, .Lkml_already_el1h
++
++	mrs	x9, daif
++	msr	daifset, #0xf
++	mov	x10, sp				// user SP (SP_EL0 while SPSel == 0)
++	msr	spsel, #1			// switch to SP_EL1 (kernel stack top)
++	ldr_this_cpu x11, __entry_task, x12
++	msr	sp_el0, x11			// sp_el0 = current
++
++	sub	sp, sp, #(PT_REGS_SIZE + 48)
++	stp	x29, x30, [sp, #0]
++	stp	x10, x9, [sp, #16]
++	str	x18, [sp, #32]
++	scs_load_current_base
++	mov	x29, sp
++	msr	daifclr, #0xf
++
++	bl	__kml_trampoline
++
++	msr	daifset, #0xf
++	ldr	x18, [sp, #32]
++	ldp	x10, x9, [sp, #16]
++	ldp	x29, x30, [sp, #0]
++	add	sp, sp, #(PT_REGS_SIZE + 48)
++	msr	sp_el0, x10			// restore user SP into SP_EL0
++	msr	spsel, #0			// switch back to EL1t (sp = SP_EL0)
++	msr	daif, x9
++	ret
++
++.Lkml_already_el1h:
++	b	__kml_trampoline
++SYM_FUNC_END(kml_trampoline)
++NOKPROBE(kml_trampoline)
++#endif
++
+ #ifdef CONFIG_ARM_SDE_INTERFACE
+ 
+ #include <asm/sdei.h>
+diff --git a/arch/arm64/kernel/syscall.c b/arch/arm64/kernel/syscall.c
+index 358ddfbf1..d16f0cb4b 100644
+--- a/arch/arm64/kernel/syscall.c
++++ b/arch/arm64/kernel/syscall.c
+@@ -7,6 +7,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/randomize_kstack.h>
+ #include <linux/syscalls.h>
++#include <linux/kml.h>
+ 
+ #include <asm/debug-monitors.h>
+ #include <asm/exception.h>
+@@ -147,3 +148,41 @@ void do_el0_svc_compat(struct pt_regs *regs)
+ 		       compat_sys_call_table);
+ }
+ #endif
++
++#ifdef CONFIG_KERNEL_MODE_LINUX
++typedef long (*kml_fn_t)(unsigned long, unsigned long, unsigned long,
++			 unsigned long, unsigned long, unsigned long);
++
++asmlinkage __visible long __kml_trampoline(const struct kml_call_args *uargs)
++{
++	struct kml_call_args args = *uargs;
++
++	if (args.is_syscall) {
++		unsigned long nr = args.fn_or_nr;
++		struct pt_regs regs = {
++			.regs = {
++				[0] = args.a0,
++				[1] = args.a1,
++				[2] = args.a2,
++				[3] = args.a3,
++				[4] = args.a4,
++				[5] = args.a5,
++			},
++			.orig_x0 = args.a0,
++			.syscallno = (s32)nr,
++			.pstate = PSR_MODE_EL1t,
++		};
++
++		if (unlikely(nr >= __NR_syscalls))
++			return -ENOSYS;
++		nr = array_index_nospec(nr, __NR_syscalls);
++		return __invoke_syscall(&regs, sys_call_table[nr]);
++	}
++
++	if (unlikely(!args.fn_or_nr))
++		return -EINVAL;
++
++	return ((kml_fn_t)args.fn_or_nr)(args.a0, args.a1, args.a2,
++					 args.a3, args.a4, args.a5);
++}
++#endif
+diff --git a/arch/arm64/kernel/vdso.c b/arch/arm64/kernel/vdso.c
+index 592dd8668..49542bc23 100644
+--- a/arch/arm64/kernel/vdso.c
++++ b/arch/arm64/kernel/vdso.c
+@@ -20,12 +20,14 @@
+ #include <linux/slab.h>
+ #include <linux/vdso_datastore.h>
+ #include <linux/vmalloc.h>
++#include <linux/kml.h>
+ #include <vdso/datapage.h>
+ #include <vdso/helpers.h>
+ #include <vdso/vsyscall.h>
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/signal32.h>
++#include <asm/syscall.h>
+ #include <asm/vdso.h>
+ 
+ enum vdso_abi {
+@@ -324,9 +326,27 @@ static struct vm_special_mapping aarch64_vdso_map __ro_after_init = {
+ 
+ static int __init vdso_init(void)
+ {
++	int ret;
++
+ 	vdso_info[VDSO_ABI_AA64].cm = &aarch64_vdso_map;
+ 
+-	return __vdso_init(VDSO_ABI_AA64);
++	ret = __vdso_init(VDSO_ABI_AA64);
++	if (ret)
++		return ret;
++
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	vdso_k_time_data->kml_trampoline = (unsigned long)kml_trampoline;
++	vdso_k_time_data->kml_sys_call_table = (unsigned long)sys_call_table;
++	vdso_k_time_data->kml_sched_timeout =
++		(unsigned long)schedule_timeout_interruptible;
++#ifdef CONFIG_TRACEPOINTS
++	vdso_k_time_data->kml_trace_call = (unsigned long)trace_call_by_kml;
++#else
++	vdso_k_time_data->kml_trace_call = 0;
++#endif
++#endif
++
++	return 0;
+ }
+ arch_initcall(vdso_init);
+ 
+diff --git a/arch/arm64/kernel/vdso/Makefile b/arch/arm64/kernel/vdso/Makefile
+index f6619e1cb..07a58c286 100644
+--- a/arch/arm64/kernel/vdso/Makefile
++++ b/arch/arm64/kernel/vdso/Makefile
+@@ -10,6 +10,8 @@
+ include $(srctree)/lib/vdso/Makefile.include
+ 
+ obj-vdso := vgettimeofday.o note.o sigreturn.o vgetrandom.o vgetrandom-chacha.o
++obj-vdso-$(CONFIG_KERNEL_MODE_LINUX) += vkml.o
++obj-vdso += $(obj-vdso-y)
+ 
+ # Build rules
+ targets := $(obj-vdso) vdso.so vdso.so.dbg
+@@ -45,9 +47,11 @@ CC_FLAGS_ADD_VDSO := -O2 -mcmodel=tiny -fasynchronous-unwind-tables $(CONFIG_CC_
+ 
+ CFLAGS_REMOVE_vgettimeofday.o = $(CC_FLAGS_REMOVE_VDSO)
+ CFLAGS_REMOVE_vgetrandom.o = $(CC_FLAGS_REMOVE_VDSO)
++CFLAGS_REMOVE_vkml.o = $(CC_FLAGS_REMOVE_VDSO)
+ 
+ CFLAGS_vgettimeofday.o = $(CC_FLAGS_ADD_VDSO)
+ CFLAGS_vgetrandom.o = $(CC_FLAGS_ADD_VDSO)
++CFLAGS_vkml.o = $(CC_FLAGS_ADD_VDSO)
+ 
+ ifneq ($(c-gettimeofday-y),)
+   CFLAGS_vgettimeofday.o += -include $(c-gettimeofday-y)
+diff --git a/arch/arm64/kernel/vdso/vdso.lds.S b/arch/arm64/kernel/vdso/vdso.lds.S
+index 52314be29..13cc6c1b3 100644
+--- a/arch/arm64/kernel/vdso/vdso.lds.S
++++ b/arch/arm64/kernel/vdso/vdso.lds.S
+@@ -104,6 +104,24 @@ VERSION
+ 		__kernel_clock_gettime;
+ 		__kernel_clock_getres;
+ 		__kernel_getrandom;
++#ifdef CONFIG_KERNEL_MODE_LINUX
++		clock_gettime;
++		__vdso_clock_gettime;
++		gettimeofday;
++		__vdso_gettimeofday;
++		sched_yield;
++		__vdso_sched_yield;
++		nanosleep;
++		__vdso_nanosleep;
++		kernel_sched_timeout;
++		__vdso_kernel_sched_timeout;
++		trace_call_by_kml;
++		__vdso_trace_call_by_kml;
++		kml_syscall;
++		__vdso_kml_syscall;
++		kml_call;
++		__vdso_kml_call;
++#endif
+ 	local: *;
+ 	};
+ }
+diff --git a/arch/arm64/kernel/vdso/vgettimeofday.c b/arch/arm64/kernel/vdso/vgettimeofday.c
+index 9941c5b04..0200f7126 100644
+--- a/arch/arm64/kernel/vdso/vgettimeofday.c
++++ b/arch/arm64/kernel/vdso/vgettimeofday.c
+@@ -10,17 +10,57 @@ int __kernel_clock_gettime(clockid_t clock, struct __kernel_timespec *ts);
+ int __kernel_gettimeofday(struct __kernel_old_timeval *tv, struct timezone *tz);
+ int __kernel_clock_getres(clockid_t clock_id, struct __kernel_timespec *res);
+ 
++#ifdef CONFIG_KERNEL_MODE_LINUX
++extern long __vdso_kml_syscall(long nr, unsigned long a0, unsigned long a1,
++			       unsigned long a2, unsigned long a3,
++			       unsigned long a4, unsigned long a5);
++
++static __always_inline bool vdso_kml_el1t(void)
++{
++	const struct vdso_time_data *vdata = &vdso_u_time_data;
++	u64 val;
++
++	OPTIMIZER_HIDE_VAR(vdata);
++	asm volatile("mrs %0, tpidrro_el0" : "=r" (val));
++	return (val & 1) != 0 && vdata->kml_trampoline != 0;
++}
++#endif
++
+ int __kernel_clock_gettime(clockid_t clock,
+ 			   struct __kernel_timespec *ts)
+ {
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (vdso_kml_el1t())
++		return (int)__vdso_kml_syscall(__NR_clock_gettime,
++					       (unsigned long)clock,
++					       (unsigned long)ts, 0, 0, 0, 0);
++#endif
+ 	return __cvdso_clock_gettime(clock, ts);
+ }
++#ifdef CONFIG_KERNEL_MODE_LINUX
++int __vdso_clock_gettime(clockid_t clock, struct __kernel_timespec *ts)
++	__attribute__((weak, alias("__kernel_clock_gettime")));
++int clock_gettime(clockid_t clock, struct __kernel_timespec *ts)
++	__attribute__((weak, alias("__kernel_clock_gettime")));
++#endif
+ 
+ int __kernel_gettimeofday(struct __kernel_old_timeval *tv,
+ 			  struct timezone *tz)
+ {
++#ifdef CONFIG_KERNEL_MODE_LINUX
++	if (vdso_kml_el1t())
++		return (int)__vdso_kml_syscall(__NR_gettimeofday,
++					       (unsigned long)tv,
++					       (unsigned long)tz, 0, 0, 0, 0);
++#endif
+ 	return __cvdso_gettimeofday(tv, tz);
+ }
++#ifdef CONFIG_KERNEL_MODE_LINUX
++int __vdso_gettimeofday(struct __kernel_old_timeval *tv, struct timezone *tz)
++	__attribute__((weak, alias("__kernel_gettimeofday")));
++int gettimeofday(struct __kernel_old_timeval *tv, struct timezone *tz)
++	__attribute__((weak, alias("__kernel_gettimeofday")));
++#endif
+ 
+ int __kernel_clock_getres(clockid_t clock_id,
+ 			  struct __kernel_timespec *res)
+diff --git a/arch/arm64/kernel/vdso/vkml.c b/arch/arm64/kernel/vdso/vkml.c
+new file mode 100644
+index 000000000..f86d9bb7b
+--- /dev/null
++++ b/arch/arm64/kernel/vdso/vkml.c
+@@ -0,0 +1,162 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AArch64 vDSO wrappers for Kernel Mode Linux (KML) direct kernel calls.
++ */
++
++#include <linux/compiler.h>
++#include <linux/types.h>
++#include <uapi/linux/time.h>
++#include <uapi/asm-generic/errno.h>
++#include <asm/unistd.h>
++#include <vdso/datapage.h>
++
++long __vdso_kml_syscall(long nr, unsigned long a0, unsigned long a1,
++			unsigned long a2, unsigned long a3, unsigned long a4,
++			unsigned long a5);
++long __vdso_kml_call(unsigned long fn, unsigned long a0, unsigned long a1,
++		     unsigned long a2, unsigned long a3, unsigned long a4,
++		     unsigned long a5);
++int __vdso_sched_yield(void);
++int __vdso_nanosleep(const struct __kernel_timespec *req,
++		     struct __kernel_timespec *rem);
++signed long __vdso_kernel_sched_timeout(signed long timeout);
++long __vdso_trace_call_by_kml(void);
++
++static __always_inline bool kml_in_el1t(void)
++{
++	u64 val;
++
++	asm volatile("mrs %0, tpidrro_el0" : "=r" (val));
++	return (val & 1) != 0;
++}
++
++static __always_inline const struct vdso_time_data *kml_get_vdso_data(void)
++{
++	const struct vdso_time_data *vdata = &vdso_u_time_data;
++
++	OPTIMIZER_HIDE_VAR(vdata);
++	return vdata;
++}
++
++static __always_inline long kml_trampoline_invoke(u64 fn_or_nr, u64 is_syscall,
++						  u64 a0, u64 a1, u64 a2,
++						  u64 a3, u64 a4, u64 a5)
++{
++	const struct vdso_time_data *vdata = kml_get_vdso_data();
++	long (*entry)(const struct kml_call_args *args);
++	struct kml_call_args args = {
++		.fn_or_nr = fn_or_nr,
++		.a0 = a0,
++		.a1 = a1,
++		.a2 = a2,
++		.a3 = a3,
++		.a4 = a4,
++		.a5 = a5,
++		.is_syscall = is_syscall,
++	};
++
++	entry = (void *)(unsigned long)vdata->kml_trampoline;
++	if (!entry)
++		return -ENOSYS;
++
++	return entry(&args);
++}
++
++static __always_inline long vdso_el0_syscall2(long _nr, unsigned long _a0,
++					      unsigned long _a1)
++{
++	register unsigned long a0 asm("x0") = _a0;
++	register unsigned long a1 asm("x1") = _a1;
++	register long nr asm("x8") = _nr;
++	register long ret asm("x0");
++
++	asm volatile("svc #0"
++		     : "=r" (ret)
++		     : "r" (a0), "r" (a1), "r" (nr)
++		     : "memory", "cc");
++	return ret;
++}
++
++long __vdso_kml_syscall(long nr, unsigned long a0, unsigned long a1,
++			unsigned long a2, unsigned long a3, unsigned long a4,
++			unsigned long a5)
++{
++	if (!kml_in_el1t())
++		return -EPERM;
++
++	return kml_trampoline_invoke((u64)nr, 1, a0, a1, a2, a3, a4, a5);
++}
++long kml_syscall(long nr, unsigned long a0, unsigned long a1,
++		 unsigned long a2, unsigned long a3, unsigned long a4,
++		 unsigned long a5)
++	__attribute__((weak, alias("__vdso_kml_syscall")));
++
++long __vdso_kml_call(unsigned long fn, unsigned long a0, unsigned long a1,
++		     unsigned long a2, unsigned long a3, unsigned long a4,
++		     unsigned long a5)
++{
++	if (!kml_in_el1t())
++		return -EPERM;
++
++	return kml_trampoline_invoke(fn, 0, a0, a1, a2, a3, a4, a5);
++}
++long kml_call(unsigned long fn, unsigned long a0, unsigned long a1,
++	      unsigned long a2, unsigned long a3, unsigned long a4,
++	      unsigned long a5)
++	__attribute__((weak, alias("__vdso_kml_call")));
++
++int __vdso_sched_yield(void)
++{
++	if (kml_in_el1t())
++		return (int)kml_trampoline_invoke(__NR_sched_yield, 1,
++						  0, 0, 0, 0, 0, 0);
++
++	return (int)vdso_el0_syscall2(__NR_sched_yield, 0, 0);
++}
++int sched_yield(void) __attribute__((weak, alias("__vdso_sched_yield")));
++
++int __vdso_nanosleep(const struct __kernel_timespec *req,
++		     struct __kernel_timespec *rem)
++{
++	if (kml_in_el1t())
++		return (int)kml_trampoline_invoke(__NR_nanosleep, 1,
++						  (unsigned long)req,
++						  (unsigned long)rem,
++						  0, 0, 0, 0);
++
++	return (int)vdso_el0_syscall2(__NR_nanosleep, (unsigned long)req,
++				      (unsigned long)rem);
++}
++int nanosleep(const struct __kernel_timespec *req,
++	      struct __kernel_timespec *rem)
++	__attribute__((weak, alias("__vdso_nanosleep")));
++
++signed long __vdso_kernel_sched_timeout(signed long timeout)
++{
++	const struct vdso_time_data *vdata = kml_get_vdso_data();
++
++	if (!kml_in_el1t())
++		return -EPERM;
++
++	return kml_trampoline_invoke(vdata->kml_sched_timeout, 0,
++				     (unsigned long)timeout, 0, 0, 0, 0, 0);
++}
++signed long kernel_sched_timeout(signed long timeout)
++	__attribute__((weak, alias("__vdso_kernel_sched_timeout")));
++
++long __vdso_trace_call_by_kml(void)
++{
++	const struct vdso_time_data *vdata = kml_get_vdso_data();
++
++	if (!kml_in_el1t())
++		return -EPERM;
++
++	if (!vdata->kml_trampoline || !vdata->kml_trace_call)
++		return -ENOSYS;
++
++	kml_trampoline_invoke(vdata->kml_trace_call, 0,
++			      0, 0, 0, 0, 0, 0);
++	return 0;
++}
++long trace_call_by_kml(void)
++	__attribute__((weak, alias("__vdso_trace_call_by_kml")));
 diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
 index de0fc580b..21bed7a06 100644
 --- a/arch/x86/entry/entry_64.S
@@ -730,5 +1184,5 @@ index 09897f76a..99e68b58c 100644
  
  /**
 -- 
-2.56.1.708.g77570a6a1d-goog
+2.56.1.750.gf70dc682cf-goog
 
